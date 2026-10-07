@@ -1,0 +1,26 @@
+* { box-sizing: border-box; }
+body { font-family: 'Segoe UI', Arial, sans-serif; width: 370px; margin: 0; padding: 16px; background: #f5f7fa; color: #333; }
+h2 { color: #bf4200; border-bottom: 2px solid #e4e6e9; padding-bottom: 9px; margin: 0 0 12px; font-size: 19px; }
+label { display: block; margin-top: 12px; font-weight: 600; font-size: 13px; color: #444; }
+input, select { width: 100%; padding: 8px; margin-top: 4px; border: 1px solid #bfc5cc; border-radius: 6px; font: 14px 'Segoe UI', sans-serif; }
+button { background: #bf4200; color: white; padding: 10px; border: 0; cursor: pointer; margin-top: 16px; width: 100%; font: 600 14px 'Segoe UI', sans-serif; border-radius: 6px; }
+button:hover { filter: brightness(1.08); }
+button:disabled { opacity: 0.5; cursor: default; }
+.stop { background: #c43830; margin-top: 8px; }
+.secondary { background: #536477; margin-top: 8px; }
+.reset { background: transparent; color: #536477; border: 1px solid #bfc5cc; margin-top: 10px; font-size: 12px; padding: 7px; }
+.status { margin-top: 16px; padding: 12px; border-radius: 6px; background: white; border: 1px solid #d6d9dd; font-size: 13px; line-height: 1.6; }
+.status strong { display: block; color: #bf4200; }
+#botStatus { display: block; font-weight: 600; margin-bottom: 5px; overflow-wrap: anywhere; }
+#message { font-size: 12px; line-height: 1.5; margin-top: 10px; overflow-wrap: anywhere; }
+#message.error { color: #a52a24; }
+#message.success { color: #247440; }
+details { margin-top: 14px; border-top: 1px solid #d6d9dd; padding-top: 12px; }
+summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+p { font-size: 12px; color: #586473; line-height: 1.5; }
+.selector { display: grid; grid-template-columns: 1fr 54px; gap: 0 6px; }
+.selector label { grid-column: 1 / -1; font-size: 12px; }
+.selector input { min-width: 0; font: 11px monospace; }
+.selector input.wide { grid-column: 1 / -1; }
+.selector button { margin-top: 4px; padding: 5px; font-size: 12px; }
+small, .footnote { font-size: 11px; color: #657180; }

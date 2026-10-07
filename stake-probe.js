@@ -1,0 +1,74 @@
+(() => {
+  'use strict';
+  // Read-only access to the site's stake and roulette connection/phase state.
+  // This script cannot access extension storage, commit state, or place bets.
+  let watchedStore = null;
+  let unsubscribe = null;
+  let animationMs = null;
+  const phaseMutations = new Set(['roulette/SOCKET_ROULETTE_disconnect', 'roulette/SOCKET_ROULETTE_init',
+    'roulette/SOCKET_ROULETTE_roll', 'roulette/SOCKET_ROULETTE_spin', 'roulette/SOCKET_ROULETTE_end', 'roulette/rolling']);
+  function siteStore() {
+    const stores = new Set([...document.querySelectorAll('[data-v-app]')]
+      .map(root => root.__vue_app__?.config?.globalProperties?.$store)
+      .filter(store => store?.state?.roulette));
+    if (stores.size !== 1) throw new Error('The site stake store is unavailable.');
+    return [...stores][0];
+  }
+  document.addEventListener('roulette-bot:read-page-health', event => {
+    if (event.target !== document.documentElement || typeof event.detail !== 'string') return;
+    let request;
+    try { request = JSON.parse(event.detail); } catch { return; }
+    if (typeof request.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(request.id)) return;
+    let response;
+    try {
+      const store = siteStore();
+      if (store !== watchedStore) {
+        try { unsubscribe?.(); } catch { /* Polling still works without a subscription. */ }
+        watchedStore = store;
+        animationMs = null;
+        unsubscribe = null;
+        try { unsubscribe = typeof store.subscribe === 'function' ? store.subscribe(mutation => {
+          const duration = mutation.payload?.animationTimer;
+          if (phaseMutations.has(mutation.type) && Number.isFinite(duration) && duration > 0 && duration <= 60000) animationMs = duration;
+          if (phaseMutations.has(mutation.type)) {
+            document.documentElement.dispatchEvent(new CustomEvent('roulette-bot:page-health-changed', { bubbles: true }));
+          }
+        }) : null; } catch { /* Read connection/phase state even if subscribing fails. */ }
+      }
+      const roulette = store.state.roulette;
+      response = {
+        initialized: typeof roulette.isInitialized === 'boolean' ? roulette.isInitialized : null,
+        roundState: ['rolling', 'spin', 'roll', 'end'].includes(roulette.roundState) ? roulette.roundState : null,
+        roundId: ['string', 'number'].includes(typeof roulette.round) ? String(roulette.round) : null,
+        animationMs
+      };
+    } catch { response = { initialized: null, roundState: null, roundId: null }; }
+    document.documentElement.dispatchEvent(new CustomEvent('roulette-bot:page-health-read', {
+      detail: JSON.stringify({ id: request.id, ...response })
+    }));
+  }, true);
+  document.addEventListener('roulette-bot:read-stake', event => {
+    const input = event.target;
+    if (!(input instanceof HTMLInputElement) || !input.isConnected || typeof event.detail !== 'string') return;
+    let request;
+    try { request = JSON.parse(event.detail); } catch { return; }
+    if (typeof request.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(request.id)) return;
+    let response;
+    try {
+      const raw = siteStore().state.roulette.betAmountRaw;
+      // Vue's reactive store unwraps the amount input's ref. Empty values are
+      // zero in the site's own rounding/validation code.
+      if (raw !== null && raw !== undefined && typeof raw !== 'number' && typeof raw !== 'string') {
+        throw new Error('The site stake has an unsupported format.');
+      }
+      const amount = Number(raw ?? 0);
+      if (!Number.isFinite(amount) || amount < 0) throw new Error('The site stake is not a valid amount.');
+      response = { success: true, amount, field: String(input.value) };
+    } catch (error) {
+      response = { success: false, error: error.message };
+    }
+    input.dispatchEvent(new CustomEvent('roulette-bot:stake-read', {
+      detail: JSON.stringify({ id: request.id, ...response })
+    }));
+  }, true);
+})();

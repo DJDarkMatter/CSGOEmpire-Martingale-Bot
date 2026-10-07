@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "CSGOEmpire Roulette Bot",
+  "version": "2.8.0",
+  "minimum_chrome_version": "111",
+  "description": "Tracks completed roulette rounds and runs a configurable missing-color strategy.",
+  "action": { "default_popup": "popup.html" },
+  "permissions": ["storage"],
+  "host_permissions": ["https://csgoempire.com/*", "https://www.csgoempire.com/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["https://csgoempire.com/*", "https://www.csgoempire.com/*"],
+    "js": ["stake-probe.js"],
+    "world": "MAIN",
+    "run_at": "document_start"
+  }, {
+    "matches": ["https://csgoempire.com/*", "https://www.csgoempire.com/*"],
+    "js": ["core.js", "toolbar.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}
