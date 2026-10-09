@@ -15,6 +15,7 @@
   let knownHistoryDirection = null;
   let passiveHistory = null;
   let missingSince = null;
+  let failureConfirmation = null;
   let reloadAsked = false;
   let recoverySignature = '';
   let recoveryStableSince = 0;
@@ -138,7 +139,7 @@
     const siteSpin = ['spin', 'roll', 'end'].includes(health?.roundState);
     // A zero clock while the site still reports betting open is not spin
     // evidence. The watchdog allows a brief transition, then reloads a stall.
-    const phase = health?.roundState === 'rolling' && countdownClosed ? 'waiting'
+    const phase = health?.roundState === 'rolling' && (countdownClosed || marker || (disabled(tButton) && disabled(ctButton))) ? 'waiting'
       : siteSpin || marker || countdownClosed || (disabled(tButton) && disabled(ctButton)) ? 'closed' : 'open';
     return { phase, controlsReady: phase === 'open' && !disabled(tButton) && !disabled(ctButton), tButton, ctButton, hasWheel, seconds, health };
   }
@@ -253,7 +254,23 @@
     recoverySignature = '';
     if (current.recovery?.reloads >= 1) {
       if (Date.now() - missingSince >= 15000) {
-        await sessionMessage(current, 'pageError', { error: 'Roulette controls are still unavailable after reloading. Check the outstanding bet before resetting.' });
+        // A stale error or the first loading observation is not proof that the
+        // reloaded page still failed. Read controls, history, and liveness again.
+        let failure;
+        try { checkLiveness(snapshot(current.config), current, Date.now()); }
+        catch (checkError) { failure = checkError; }
+        if (!failure) { missingSince = null; failureConfirmation = null; return; }
+        if (!(failure instanceof PageUnavailable)) return; // Setup errors use their own path.
+        const now = Date.now();
+        if (failureConfirmation?.sessionId !== current.id || failureConfirmation.recoverySince !== current.recovery.since ||
+            failureConfirmation.reason !== failure.message) {
+          failureConfirmation = { sessionId: current.id, recoverySince: current.recovery.since,
+            reason: failure.message, since: now, reported: false };
+          return;
+        }
+        if (now - failureConfirmation.since < 750 || failureConfirmation.reported) return;
+        failureConfirmation.reported = true;
+        await sessionMessage(current, 'recoveryFailed', { recoverySince: current.recovery.since, error: failure.message });
       }
     } else if (!reloadAsked) {
       reloadAsked = true;
@@ -263,6 +280,28 @@
       await sessionMessage(current, 'pageUnavailable', { error: error.message, reload: true, notClickedBetId });
     }
   }
+  function checkLiveness(sample, session, now) {
+    if (liveness?.sessionId !== session.id || liveness.roundId !== (sample.health?.roundId || null)) {
+      liveness = { sessionId: session.id, roundId: sample.health?.roundId || null, zeroSince: null, closedSince: null, clockMissingSince: null };
+    }
+    const genuineSpin = ['spin', 'roll', 'end'].includes(sample.health?.roundState);
+    if (sample.seconds === 0 && !genuineSpin) {
+      liveness.zeroSince ??= now;
+      const grace = sample.health?.roundState === 'rolling' ? 1500 : 8000;
+      if (now - liveness.zeroSince >= grace) throw new PageUnavailable('Roulette countdown is stuck at zero; reloading the saved session.');
+    } else liveness.zeroSince = null;
+    if (sample.phase === 'waiting' && sample.seconds === null) {
+      liveness.clockMissingSince ??= now;
+      if (now - liveness.clockMissingSince >= 500) throw new PageUnavailable('Betting is open internally but the countdown disappeared; reloading roulette.');
+    } else liveness.clockMissingSince = null;
+    if (sample.phase === 'closed') {
+      liveness.closedSince ??= now;
+      // The default wheel animation takes six seconds plus its end period.
+      // Honor a longer duration announced by the site before calling it stuck.
+      const spinLimit = Math.max(10000, (sample.health?.animationMs || 0) + 2000);
+      if (now - liveness.closedSince >= spinLimit) throw new PageUnavailable('Roulette spin/countdown has stopped progressing; reloading the saved session.');
+    } else liveness.closedSince = null;
+  }
   async function watchPage() {
     if (watchingPage || pickerCleanup) return;
     const session = ownSession();
@@ -270,27 +309,11 @@
     watchingPage = true;
     try {
       const sample = rouletteControls(session.config);
-      const now = Date.now();
-      if (liveness?.sessionId !== session.id || liveness.roundId !== (sample.health?.roundId || null)) {
-        liveness = { sessionId: session.id, roundId: sample.health?.roundId || null, zeroSince: null, closedSince: null, clockMissingSince: null };
+      if (session.recovery && sample.phase === 'closed' && !session.pending && Core.hasLosingProgression(session)) {
+        await sessionMessage(session, 'recoverPage', { page: pageState(sample) });
+        return;
       }
-      const genuineSpin = ['spin', 'roll', 'end'].includes(sample.health?.roundState);
-      if (sample.seconds === 0 && !genuineSpin) {
-        liveness.zeroSince ??= now;
-        const grace = sample.health?.roundState === 'rolling' ? 1500 : 8000;
-        if (now - liveness.zeroSince >= grace) throw new PageUnavailable('Roulette countdown is stuck at zero; reloading the saved session.');
-      } else liveness.zeroSince = null;
-      if (sample.phase === 'waiting' && sample.seconds === null) {
-        liveness.clockMissingSince ??= now;
-        if (now - liveness.clockMissingSince >= 500) throw new PageUnavailable('Betting is open internally but the countdown disappeared; reloading roulette.');
-      } else liveness.clockMissingSince = null;
-      if (sample.phase === 'closed') {
-        liveness.closedSince ??= now;
-        // The default wheel animation takes six seconds plus its end period.
-        // Honor a longer duration announced by the site before calling it stuck.
-        const spinLimit = Math.max(10000, (sample.health?.animationMs || 0) + 2000);
-        if (now - liveness.closedSince >= spinLimit) throw new PageUnavailable('Roulette spin/countdown has stopped progressing; reloading the saved session.');
-      } else liveness.closedSince = null;
+      checkLiveness(sample, session, Date.now());
     } catch (error) {
       if (error instanceof PageUnavailable) {
         try { await missingPage(session, error); }
@@ -549,6 +572,14 @@
     try {
       const sample = snapshot(session.config);
       const now = Date.now();
+      if (session.recovery && sample.phase === 'closed' && !session.pending && Core.hasLosingProgression(session)) {
+        await sessionMessage(session, 'recoverPage', { page: pageState(sample) });
+        return;
+      }
+      checkLiveness(sample, session, now);
+      // Readable history or a normal spin breaks a continuous failure. Do not
+      // charge its time to an earlier loading error while awaiting reopening.
+      missingSince = null; failureConfirmation = null;
       const timing = Core.settings(session.config);
       const chooseTarget = () => timing.betBeforeSeconds + (Math.random() * 2 - 1) * timing.timingVarianceSeconds;
       if (sample.phase === 'waiting') return;
@@ -570,7 +601,7 @@
           signature: JSON.stringify([sample.identity, sample.history || sample.side]), stableSince: now - 1000,
           committedCycle: cycle, history: sample.history, historySide: page.history.at(-1),
           historyDirection: page.historyDirection, historyLimit: Math.max(10, sample.history?.length || 0), betAtSeconds: chooseTarget() };
-        missingSince = null; reloadAsked = false; recoverySignature = ''; visibilityChanged = false; lastSent = '';
+        missingSince = null; failureConfirmation = null; reloadAsked = false; recoverySignature = ''; visibilityChanged = false; lastSent = '';
         interruptedSession = null; liveness = null;
         return;
       }

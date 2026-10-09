@@ -100,6 +100,7 @@ async function contentHarness(options = {}) {
   const worker = workerHarness({ config }, () => clock);
   let generation = 0;
   let pageLoading = false;
+  let missingForOneRead = null;
   let visibilityListener;
   let replacedInput = false;
   let tick;
@@ -318,6 +319,7 @@ async function contentHarness(options = {}) {
     documentElement: new Element('html'),
     querySelectorAll(selector) {
       if (selector === '[data-v-app]') return [{ __vue_app__: { config: { globalProperties: { $store: siteStore } } } }];
+      if (selector === missingForOneRead) { missingForOneRead = null; return []; }
       if (pageLoading && selector !== Core.DEFAULTS.selectors.balance) return [];
       if (options.siteLayout && selector === Core.DEFAULTS.selectors.history) return history;
       if (options.siteLayout && selector === Core.DEFAULTS.selectors.result) return [history.at(-1)];
@@ -438,6 +440,7 @@ async function contentHarness(options = {}) {
     },
     async timer(value) { countdown.isConnected = true; countdown.textContent = String(value); watchdogTick(); tick(); await flush(); },
     async loading(value) { pageLoading = value; tick(); await flush(); },
+    restoreForFinalCheck(selector) { pageLoading = false; missingForOneRead = selector; },
     async hidden(value) { document.hidden = value; visibilityListener(); await flush(); },
     async reload() { bootContent(); await flush(); clock += 1200; tick(); await flush(); clock += 1000; tick(); await flush(); tick(); await flush(); },
     async advance(milliseconds) {
@@ -490,15 +493,15 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
       assert.equal(state.wins, result === side ? 1 : 0); assert.equal(state.losses, result === side ? 0 : 1);
     }
   });
-  await test('missed losing rounds never fabricate extra losses or double a stake that was not placed', () => {
+  await test('a required next betting window missed during losing rolls aborts without fabricating additional losses or doubling', () => {
     for (const mode of ['accepted', 'chase']) {
       const { state, history, page } = recoveryFixture('T', mode);
       const before = state.netLossCents;
       const after = [...history.slice(2), 'CT', 'Dice'];
-      assert.equal(Core.recover(state, page(after), 22000), true);
-      assert.equal(state.active, true); assert.equal(state.nextBetCents, mode === 'accepted' ? 2 : 4);
+      assert.equal(Core.recover(state, page(after), 22000), false);
+      assert.equal(state.active, false); assert.equal(state.nextBetCents, mode === 'accepted' ? 2 : 4);
       assert.equal(state.netLossCents, before + (mode === 'accepted' ? 1 : 0));
-      assert.equal(state.countsLowerBound.T, true); assert.equal(state.missingRounds.CT, 1);
+      assert.match(state.status, /next T betting window closed/); assert.equal(state.pending, null);
     }
   });
   await test('a winning opportunity missed during a chase stops betting, while still settling a known previous loss', () => {
@@ -507,9 +510,58 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
       const before = state.netLossCents;
       const after = [...history.slice(2), 'Dice', 'T'];
       assert.equal(Core.recover(state, page(after), 22000), false);
-      assert.equal(state.active, false); assert.match(state.status, /winning round was missed/);
+      assert.equal(state.active, false); assert.match(state.status, /next T betting window closed/);
       assert.equal(state.netLossCents, before + (mode === 'accepted' ? 1 : 0));
       assert.equal(state.wins, 0); assert.equal(state.pending, null);
+    }
+  });
+  await test('recovered losses continue in the immediately following open window and abort after any further unbet result on either coin', () => {
+    for (const side of ['T', 'CT']) {
+      const stillOpen = recoveryFixture(side);
+      const afterLoss = [...stillOpen.history.slice(1), 'Dice'];
+      assert.equal(Core.recover(stillOpen.state, stillOpen.page(afterLoss), 13000), true);
+      const next = Core.observe(stillOpen.state, { phase: 'open', side: 'Dice', openKey: 'recovered-open', resultKey: 'recovered-result',
+        controlsReady: true, placementWindow: 'ready' }, randomUUID);
+      assert.ok(next); assert.equal(next.side, side); assert.equal(next.amountCents, 2);
+      assert.equal(stillOpen.state.active, true); assert.equal(stillOpen.state.losses, 1);
+      for (const unbetResult of ['Dice', 'T', 'CT']) {
+        const missed = recoveryFixture(side);
+        const after = [...missed.history.slice(2), 'Dice', unbetResult];
+        assert.equal(Core.recover(missed.state, missed.page(after), 22000), false);
+        assert.equal(missed.state.active, false); assert.match(missed.state.status, /betting window closed/);
+        assert.equal(missed.state.losses, 1); assert.equal(missed.state.wins, 0); assert.equal(missed.state.netLossCents, 1);
+        assert.equal(missed.state.nextBetCents, 2); assert.equal(missed.state.pending, null);
+      }
+    }
+  });
+  await test('closed recovery aborts an unplaced doubled stake but never mistakes an accepted current spin or an unbet startup for the next window', () => {
+    for (const side of ['T', 'CT']) {
+      const chase = recoveryFixture(side, 'chase');
+      assert.equal(Core.recover(chase.state, { phase: 'closed' }, 13000), false);
+      assert.equal(chase.state.active, false); assert.match(chase.state.status, /betting window closed/);
+      assert.equal(chase.state.losses, 2); assert.equal(chase.state.netLossCents, 3); assert.equal(chase.state.nextBetCents, 4);
+      const accepted = recoveryFixture(side);
+      const betId = accepted.state.pending.id;
+      assert.equal(Core.recover(accepted.state, { phase: 'closed' }, 13000), false);
+      assert.equal(accepted.state.active, true); assert.ok(accepted.state.recovery); assert.equal(accepted.state.pending.id, betId);
+      assert.equal(accepted.state.losses, 0);
+    }
+    const startup = Core.create(Core.settings(), 1, 'doc-1', 'startup');
+    Core.loading(startup, 'Loading');
+    assert.equal(Core.recover(startup, { phase: 'closed' }), false);
+    assert.equal(startup.active, true); assert.ok(startup.recovery); assert.equal(startup.losses, 0);
+  });
+  await test('an accepted recovered win ends its progression so later unbet rounds do not trigger a doubled-window abort', () => {
+    for (const side of ['T', 'CT']) {
+      const won = recoveryFixture(side);
+      const previous = [side, side === 'T' ? 'CT' : 'T', 'Dice', side, side === 'T' ? 'CT' : 'T'];
+      won.state.checkpoint.history = previous;
+      won.state.missingRounds = Core.missingFromHistory(previous);
+      const after = [...previous.slice(2), side, 'Dice'];
+      assert.equal(Core.recover(won.state, won.page(after), 22000), true);
+      assert.equal(won.state.active, true); assert.equal(won.state.pending, null); assert.equal(won.state.chaseSide, null);
+      assert.equal(won.state.wins, 1); assert.equal(won.state.losses, 0); assert.equal(won.state.netLossCents, -1);
+      assert.equal(won.state.nextBetCents, 1);
     }
   });
   await test('ambiguous or overwritten history and unconfirmed submitted stakes stop recovery without invented outcomes', () => {
@@ -524,6 +576,56 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
       const pending = clone(state.pending);
       round(state, 10, 'T'); assert.deepEqual(state.pending, pending);
     }
+  });
+  await test('unmatched history with no outstanding bet or losing progression resumes from a fresh baseline and preserves settled profit', () => {
+    const history = ['T', 'Dice', 'CT', 'CT', 'CT'];
+    const state = Core.create(Core.settings({ betAmount: .01, turnsWait: 50 }), 1, 'doc-1', 'safe-recovery', history, 'last', 10000);
+    Core.observe(state, { phase: 'open', side: 'CT', openKey: 'saved-open', resultKey: 'saved-result', controlsReady: true }, randomUUID);
+    state.wins = 2; state.losses = 1; state.netLossCents = -3;
+    Core.checkpoint(state, { phase: 'open', history, seconds: 10, hasWheel: true }, 10000);
+    Core.loading(state, 'Loading', 11000);
+    const after = ['Dice', 'Dice', 'Dice', 'Dice', 'Dice'];
+    assert.equal(Core.recover(state, { phase: 'open', history: after, seconds: 25, hasWheel: true,
+      openKey: 'restored-open', resultKey: 'restored-result' }, 60000), true);
+    assert.equal(state.active, true); assert.equal(state.recovery, null); assert.equal(state.pending, null);
+    assert.deepEqual(state.missingRounds, { T: 5, CT: 5 }); assert.equal(state.rounds, 0);
+    assert.equal(state.wins, 2); assert.equal(state.losses, 1); assert.equal(state.netLossCents, -3);
+    assert.equal(state.startedAt, 10000); assert.equal(state.nextBetCents, 1);
+  });
+  await test('unreadable history with no bet stays in recovery and retries without stopping or inventing counters', () => {
+    const state = Core.create(Core.settings({ turnsWait: 50 }), 1, 'doc-1', 'empty-history', ['CT', 'CT']);
+    Core.loading(state, 'Loading');
+    assert.equal(Core.recover(state, { phase: 'open', history: [], openKey: 'bad-open', resultKey: 'bad-result' }), false);
+    assert.equal(state.active, true); assert.ok(state.recovery); assert.equal(state.needsReview, undefined);
+    assert.deepEqual(state.missingRounds, { T: 2, CT: 0 }); assert.equal(state.losses, 0);
+    assert.equal(Core.recover(state, { phase: 'open', history: ['T', 'CT', 'CT'], seconds: 25,
+      openKey: 'good-open', resultKey: 'good-result' }), true);
+    assert.equal(state.recovery, null); assert.deepEqual(state.missingRounds, { T: 2, CT: 0 });
+  });
+  await test('an unclicked first reservation interrupted by loading is not a losing progression, while a doubled stake retains its coin', () => {
+    const first = recoveryFixture('T', 'submitted');
+    first.state.pending.status = 'reserved'; first.state.recovery = null;
+    Core.loading(first.state, 'Controls disappeared', 12000);
+    assert.equal(first.state.pending, null); assert.equal(first.state.chaseSide, null);
+    const after = [...first.history.slice(1), 'T'];
+    assert.equal(Core.recover(first.state, first.page(after), 13000), true);
+    assert.equal(first.state.active, true); assert.equal(first.state.losses, 0); assert.equal(first.state.wins, 0);
+    assert.equal(first.state.netLossCents, 0); assert.equal(first.state.nextBetCents, 1);
+    const doubled = recoveryFixture('CT', 'chase');
+    assert.equal(Core.recover(doubled.state, doubled.page(), 13000), true);
+    const bet = Core.observe(doubled.state, { phase: 'open', side: 'T', openKey: 'recovered-open', resultKey: 'recovered-result',
+      controlsReady: true, placementWindow: 'ready' }, randomUUID);
+    assert.ok(bet);
+    Core.loading(doubled.state, 'Controls disappeared', 14000);
+    assert.equal(doubled.state.pending, null); assert.equal(doubled.state.chaseSide, 'CT'); assert.equal(doubled.state.nextBetCents, 4);
+    assert.equal(Core.recover(doubled.state, doubled.page(doubled.history, 20), 15000), true);
+    assert.equal(doubled.state.active, true); assert.equal(doubled.state.losses, 2); assert.equal(doubled.state.netLossCents, 3);
+  });
+  await test('an overwritten history during an actual losing progression still stops even with no current bet outstanding', () => {
+    const { state, page } = recoveryFixture('T', 'chase');
+    assert.equal(Core.recover(state, page(['Dice', 'Dice', 'Dice', 'Dice', 'Dice']), 60000), false);
+    assert.equal(state.active, false); assert.match(state.status, /history cannot be matched/);
+    assert.equal(state.losses, 2); assert.equal(state.netLossCents, 3); assert.equal(state.nextBetCents, 4);
   });
   await test('Stop during loading can settle an outstanding accepted loss but never resumes or reserves a bet', () => {
     const { state, history, page } = recoveryFixture();
@@ -716,28 +818,30 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
     assert.equal(page.clicked(), 1); assert.equal(page.worker.read().session.pending.status, 'submitted');
     assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.needsReview, true);
   });
-  await test('returning too late skips the chase bet, then stops if that unbet round wins without recording a win', () => {
+  await test('a doubled bet with too little preparation time aborts on closure without waiting for the unbet result', () => {
     const { state, history, page } = recoveryFixture('T', 'chase');
     Core.recover(state, page(history, 4), 13000);
     const opening = { phase: 'open', side: 'CT', openKey: 'recovered-open', resultKey: 'recovered-result',
       controlsReady: true, placementWindow: 'late' };
     assert.equal(Core.observe(state, opening, randomUUID), null);
-    assert.ok(state.skippedChaseRoundKey); assert.equal(state.nextBetCents, 4);
+    assert.equal(state.active, true); assert.ok(state.skippedChaseRoundKey); assert.equal(state.nextBetCents, 4);
+    Core.observe(state, { phase: 'closed' }, randomUUID);
+    assert.equal(state.active, false); assert.match(state.status, /next T betting window closed/);
     assert.equal(round(state, 1, 'T', false), null);
-    assert.equal(state.active, false); assert.match(state.status, /winning round was missed/);
+    assert.equal(state.active, false); assert.match(state.status, /next T betting window closed/);
     assert.equal(state.wins, 0); assert.equal(state.netLossCents, 3); assert.equal(state.losses, 2);
   });
-  await test('a chase window missed while waiting keeps the stake after another unbet loss and doubles only the next accepted loss', () => {
+  await test('a required doubled window missed while waiting aborts even when the following unbet result is Dice', () => {
     const { state, history, page } = recoveryFixture('T', 'chase');
     Core.recover(state, page(history), 13000);
     Core.observe(state, { phase: 'open', side: 'CT', openKey: 'recovered-open', resultKey: 'recovered-result',
       controlsReady: true, placementWindow: 'waiting', betAtSeconds: 10 }, randomUUID);
     Core.observe(state, { phase: 'closed' }, randomUUID);
-    assert.ok(state.skippedChaseRoundKey);
+    assert.equal(state.active, false); assert.match(state.status, /next T betting window closed/);
     const bet = round(state, 1, 'Dice');
-    assert.equal(bet.amountCents, 4); assert.equal(state.losses, 2); assert.equal(state.netLossCents, 3);
-    const next = round(state, 2, 'CT'); assert.equal(next.amountCents, 8);
-    assert.equal(state.losses, 3); assert.equal(state.netLossCents, 7);
+    assert.equal(bet, null); assert.equal(state.nextBetCents, 4); assert.equal(state.losses, 2); assert.equal(state.netLossCents, 3);
+    const next = round(state, 2, 'CT'); assert.equal(next, null);
+    assert.equal(state.losses, 2); assert.equal(state.netLossCents, 3);
   });
   await test('a missed winning opportunity during a page gap stops the content adapter instead of following the chase', async () => {
     const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, betAmount: .01, turnsWait: 3,
@@ -745,17 +849,163 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
     await page.loading(true); await page.openRound(1, 'dice'); await page.openRound(2, 't');
     await page.loading(false); await page.advance(1000); page.tick(); await flush();
     const state = page.worker.read().session;
-    assert.equal(state.active, false); assert.match(state.status, /winning round was missed/);
+    assert.equal(state.active, false); assert.match(state.status, /next T betting window closed/);
     assert.equal(state.losses, 1); assert.equal(state.wins, 0); assert.equal(state.netLossCents, 1);
     assert.equal(page.clicked(), 1);
   });
-  await test('a failed reload times out while retaining the outstanding stake for review and never enters a reload loop', async () => {
+  await test('a failed reload requires two fresh delayed failure checks and retains the outstanding stake for review without a reload loop', async () => {
     const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, betAmount: .01, turnsWait: 3,
       initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
     await page.loading(true); await page.advance(2100); await page.advance(15000);
+    assert.equal(page.worker.read().session.active, true, 'The first final failure check alone must not stop a bet.');
+    await page.advance(749); assert.equal(page.worker.read().session.active, true);
+    await page.advance(1);
     const state = page.worker.read().session;
     assert.equal(state.active, false); assert.equal(state.needsReview, true); assert.ok(state.pending);
     assert.equal(state.losses, 0); assert.equal(page.clicked(), 1); assert.deepEqual(page.worker.reloadCalls, [1]);
+    const reports = page.messages.filter(message => message.action === 'recoveryFailed');
+    assert.equal(reports.length, 1); assert.match(reports[0].request.error, /found no visible elements/);
+  });
+  await test('a failed reload with no placed bet keeps running and resumes after the page returns, without fake wins or losses', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true, betAmount: .01,
+      turnsWait: 50, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
+    const saved = page.worker.read().session;
+    await page.loading(true); await page.reload(); await page.advance(16000); await page.advance(750);
+    assert.equal(page.worker.read().session.active, true); assert.ok(page.worker.read().session.recovery);
+    assert.equal(page.worker.read().session.pending, null); assert.match(page.worker.read().session.status, /Waiting for roulette to recover/);
+    await page.advance(20000);
+    assert.equal(page.messages.filter(message => message.action === 'recoveryFailed').length, 1);
+    await page.loading(false); await page.advance(1000);
+    const restored = page.worker.read().session;
+    assert.equal(restored.active, true); assert.equal(restored.recovery, null); assert.equal(restored.id, saved.id);
+    assert.equal(restored.startedAt, saved.startedAt); assert.notEqual(restored.documentId, saved.documentId);
+    assert.equal(restored.losses, 0); assert.equal(restored.wins, 0); assert.equal(restored.netLossCents, 0);
+    assert.equal(page.clicked(), 0); assert.deepEqual(page.worker.reloadCalls, [1]);
+  });
+  await test('a healthy final page read overrides a transient missing-control observation after the old timeout', async () => {
+    const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, betAmount: .01, turnsWait: 3,
+      initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], initialSeconds: 25 });
+    await page.timer(9.8); // Place one accepted stake, then expose a longer saved countdown.
+    await page.timer(25);
+    const betId = page.worker.read().session.pending.id;
+    await page.loading(true); await page.advance(16000);
+    page.restoreForFinalCheck(Core.DEFAULTS.selectors.tButton);
+    await page.advance(750);
+    assert.equal(page.worker.read().session.active, true);
+    assert.equal(page.messages.filter(message => message.action === 'recoveryFailed').length, 0);
+    await page.advance(1000);
+    assert.equal(page.worker.read().session.recovery, null); assert.equal(page.worker.read().session.pending.id, betId);
+    assert.equal(page.clicked(), 1); assert.equal(page.worker.read().session.losses, 0);
+  });
+  await test('returning controls during a legitimate spin clear the earlier failure clock instead of timing out after reload', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true, betAmount: .01, turnsWait: 3,
+      initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
+    await page.loading(true); await page.advance(14000);
+    await page.closeRound(); await page.loading(false);
+    await page.advance(10000); await page.advance(750);
+    assert.equal(page.worker.read().session.active, true, 'A later spin stall has its own failure window.');
+    assert.equal(page.messages.filter(message => message.action === 'recoveryFailed').length, 0);
+    await page.openRound(1, 'dice'); await page.advance(1000);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.losses, 1);
+    assert.deepEqual(page.clickedAmounts, [1, 2]); assert.deepEqual(page.worker.reloadCalls, [1]);
+  });
+  await test('a delayed recovery-failure message cannot stop a recovered session or a newer interruption', async () => {
+    const { state, page } = recoveryFixture(); state.recovery.reloads = 1;
+    let now = 13000;
+    const worker = workerHarness({ config: state.config, session: state }, () => now);
+    const owner = { documentId: state.documentId, sessionId: state.id };
+    const delayed = { action: 'recoveryFailed', ...owner, recoverySince: state.recovery.since, error: 'Old failure' };
+    await worker.dispatch({ action: 'recoverPage', ...owner, page: page() }, worker.contentSender);
+    await worker.dispatch(delayed, worker.contentSender);
+    assert.equal(worker.read().session.active, true); assert.equal(worker.read().session.recovery, null);
+    now = 14000;
+    await worker.dispatch({ action: 'pageUnavailable', ...owner, error: 'New interruption', reload: true }, worker.contentSender);
+    await worker.dispatch(delayed, worker.contentSender);
+    assert.equal(worker.read().session.active, true); assert.equal(worker.read().session.recovery.since, 14000);
+    assert.equal(worker.read().session.pending.status, 'accepted'); assert.equal(worker.read().session.needsReview, undefined);
+  });
+  await test('a recovery failure with no current bet preserves a doubled progression until its readable history can be reconciled', async () => {
+    const { state, history, page } = recoveryFixture('CT', 'chase'); state.recovery.reloads = 1;
+    const worker = workerHarness({ config: state.config, session: state }, () => 26000);
+    const owner = { documentId: state.documentId, sessionId: state.id };
+    await worker.dispatch({ action: 'recoveryFailed', ...owner, recoverySince: state.recovery.since, error: 'Still loading' }, worker.contentSender);
+    assert.equal(worker.read().session.active, true); assert.ok(worker.read().session.recovery);
+    assert.equal(worker.read().session.nextBetCents, 4); assert.equal(worker.read().session.chaseSide, 'CT');
+    assert.equal(worker.read().session.losses, 2); assert.equal(worker.read().session.netLossCents, 3);
+    const recovered = await worker.dispatch({ action: 'recoverPage', ...owner, page: page(history, 8) }, worker.contentSender);
+    assert.equal(recovered.session.active, true); assert.equal(recovered.session.recovery, null);
+    assert.equal(recovered.session.nextBetCents, 4); assert.equal(recovered.session.losses, 2);
+  });
+  await test('a known loss waiting for its doubled bet aborts as soon as the following window closes with no extra click or loss', async () => {
+    for (const side of ['T', 'CT']) {
+      const other = side === 'T' ? 'CT' : 'T';
+      const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+        betAmount: .01, turnsWait: 3, initialHistory: [side, 'Dice', other, other, other], roundSeconds: 25 });
+      await page.complete(1, 'dice');
+      assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.losses, 1);
+      assert.equal(page.worker.read().session.pending, null); assert.equal(page.worker.read().session.nextBetCents, 2);
+      await page.closeRound();
+      const stopped = page.worker.read().session;
+      assert.equal(stopped.active, false); assert.match(stopped.status, /betting window closed/);
+      assert.equal(stopped.losses, 1); assert.equal(stopped.netLossCents, 1); assert.deepEqual(page.clickedAmounts, [1]);
+      await page.openRound(2, 'dice'); assert.deepEqual(page.clickedAmounts, [1]);
+      assert.equal(page.worker.read().session.losses, 1);
+    }
+  });
+  await test('the recovery watchdog aborts a known unplaced doubled stake when returning controls prove its window is closed', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], roundSeconds: 25 });
+    await page.complete(1, 'dice');
+    await page.loading(true);
+    assert.equal(page.worker.read().session.active, true); assert.ok(page.worker.read().session.recovery);
+    await page.closeRound();
+    page.restoreForFinalCheck(null); page.watchdog(); await flush();
+    const stopped = page.worker.read().session;
+    assert.equal(stopped.active, false); assert.equal(stopped.recovery, null);
+    assert.match(stopped.status, /next T betting window closed/);
+    assert.equal(stopped.losses, 1); assert.equal(stopped.netLossCents, 1); assert.equal(stopped.nextBetCents, 2);
+    assert.deepEqual(page.clickedAmounts, [1]); assert.deepEqual(page.worker.reloadCalls, [1]);
+  });
+  await test('closure during doubled-stake preparation cancels the reservation and prevents a delayed money click', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], roundSeconds: 25, manualTimers: true });
+    await page.advance(2000); assert.deepEqual(page.clickedAmounts, [1]);
+    await page.complete(1, 'dice'); await page.timer(9.8);
+    assert.equal(page.worker.read().session.pending.status, 'reserved'); assert.equal(page.worker.read().session.pending.amountCents, 2);
+    await page.closeRound();
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.pending, null);
+    assert.match(page.worker.read().session.status, /next T betting window closed/);
+    await page.advance(2000); await page.openRound(2, 'dice');
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.losses, 1);
+    assert.equal(page.worker.read().session.netLossCents, 1);
+  });
+  await test('temporarily disabled controls and zero while the site still reports open never fabricate a closed doubled window', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], roundSeconds: 25 });
+    await page.complete(1, 'dice');
+    page.t.attrs.disable = 'true'; page.ct.attrs.disable = 'true';
+    await page.advance(1000);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.losses, 1);
+    assert.equal(page.worker.read().session.pending, null); assert.deepEqual(page.worker.reloadCalls, []);
+    await page.timer(0); await page.advance(1500);
+    assert.equal(page.worker.read().session.active, true); assert.deepEqual(page.worker.reloadCalls, [1]);
+    page.t.attrs.disable = 'false'; page.ct.attrs.disable = 'false';
+    await page.timer(9.8); await page.advance(1000); page.tick(); await flush();
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.recovery, null);
+    assert.deepEqual(page.clickedAmounts, [1, 2]); assert.equal(page.worker.read().session.pending.status, 'accepted');
+    await page.complete(2, 't');
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.nextBetCents, 1);
+    assert.equal(page.worker.read().session.wins, 1); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('Stop while a no-bet recovery keeps waiting cancels automatic resume and additional reloads', async () => {
+    const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, turnsWait: 50,
+      initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
+    await page.loading(true); await page.advance(16000); await page.advance(750);
+    await page.toolbar.stop(); await page.loading(false); await page.advance(1000);
+    await page.complete(1, 'dice'); await page.advance(20000);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.userStopped, true);
+    assert.equal(page.clicked(), 0); assert.deepEqual(page.worker.reloadCalls, [1]);
+    assert.equal(page.worker.read().session.netLossCents, 0);
   });
   await test('a round missed by the tab observer can be reconciled without a reload or a fabricated extra loss', async () => {
     const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, betAmount: .01, turnsWait: 3,

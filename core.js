@@ -176,6 +176,12 @@
     if (!session.active) return;
     if (!session.recovery) session.recovery = { since: now, reloads: 0 };
     if (session.pending?.status === 'reserved') session.pending = null;
+    // Selecting a coin for an unclicked first stake is not a losing progression.
+    // A real loss always leaves a doubled stake, which must retain its coin.
+    if (!session.pending && session.nextBetCents === cents(session.config.betAmount, 'Base bet')) {
+      session.chaseSide = null;
+      session.skippedChaseRoundKey = null;
+    }
     session.recovery.reason = String(reason || 'Roulette controls temporarily unavailable.').slice(0, 500);
     session.status = 'Loading — preserving the session and waiting for roulette controls.';
   }
@@ -209,8 +215,22 @@
     session.pending = null;
     return win;
   }
+  function hasLosingProgression(session) {
+    return !!session.chaseSide && session.nextBetCents > cents(session.config.betAmount, 'Base bet');
+  }
+  function abortMissedNextBet(session, now = Date.now()) {
+    if (session.pending?.status === 'reserved') session.pending = null;
+    session.recovery = null;
+    pause(session, `Stopped: the next ${session.chaseSide} betting window closed before its doubled bet was placed. No additional loss recorded.`, now);
+    return false;
+  }
   function recover(session, page, now = Date.now()) {
-    if (session.needsReview || (!session.active && session.pending?.status !== 'accepted') || !session.recovery || page.phase !== 'open') return false;
+    if (session.needsReview || (!session.active && session.pending?.status !== 'accepted') || !session.recovery) return false;
+    if (page.phase === 'closed') {
+      if (session.active && hasLosingProgression(session) && !session.pending) return abortMissedNextBet(session, now);
+      return false; // An already accepted bet may still be finishing its own spin.
+    }
+    if (page.phase !== 'open') return false;
     const halt = reason => {
       session.needsReview = !!session.pending;
       session.recovery = null;
@@ -218,26 +238,33 @@
       return false;
     };
     const previous = session.checkpoint;
-    // An armed startup has placed no bet and established no betting window.
-    // After a reload, seed it from the first readable completed history rather
-    // than inventing results for the spin during which Start was pressed.
-    if (session.lastOpenKey === null && !session.pending && !session.chaseSide &&
-        Array.isArray(page.history) && page.history.length > 0 && page.history.length <= 100 &&
-        page.history.every(side => ['T', 'CT', 'Dice'].includes(side)) && page.openKey && page.resultKey) {
+    const readable = Array.isArray(page.history) && page.history.length > 0 && page.history.length <= 100 &&
+      page.history.every(side => ['T', 'CT', 'Dice'].includes(side)) && page.openKey && page.resultKey;
+    const canRebase = !session.pending && !session.chaseSide;
+    const rebase = () => {
       session.missingRounds = missingFromHistory(page.history);
+      session.countsLowerBound = {};
       session.historyInitialized = true;
       session.historyDirection = page.historyDirection || session.historyDirection;
       session.lastOpenKey = page.openKey;
       session.lastResultKey = page.resultKey;
       session.lastResultSide = page.history.at(-1);
       session.waitingRoundKey = page.openKey;
+      session.skippedChaseRoundKey = null;
       session.recovery = null;
       checkpoint(session, page, now);
-      session.status = 'Running — current history scanned; waiting for the next betting window.';
+      session.status = 'Recovered — current history scanned; waiting for the next betting window.';
       return true;
-    }
-    if (!previous?.history?.length || !Array.isArray(page.history) || !page.history.length || page.history.length > 100 ||
-        page.history.some(side => !['T', 'CT', 'Dice'].includes(side)) || !page.openKey || !page.resultKey) {
+    };
+    // An armed startup has placed no bet and established no betting window.
+    // After a reload, seed it from the first readable completed history rather
+    // than inventing results for the spin during which Start was pressed.
+    if (canRebase && readable && (session.lastOpenKey === null || !previous?.history?.length)) return rebase();
+    if (!previous?.history?.length || !readable) {
+      if (canRebase) {
+        session.status = 'Waiting for readable roulette history — no bet is outstanding.';
+        return false;
+      }
       return halt('Recovery needs a readable saved result history. Check the outstanding bet before resetting.');
     }
     if (session.pending && session.pending.status !== 'accepted') {
@@ -257,6 +284,9 @@
       (previous.identity && page.identity && previous.identity !== page.identity);
     if (resetCountdown && !sameWindow) paths = paths.filter(path => path.length > 0);
     if (!paths.length) {
+      // No outstanding wager or losing progression depends on these old rolls.
+      // Start a fresh visible baseline without changing settled profit or bets.
+      if (canRebase) return rebase();
       return halt('Recovery stopped: recent history cannot be matched to the saved round. No further bet placed.');
     }
     const pending = session.pending;
@@ -266,11 +296,12 @@
         return halt('Recovery stopped: the outstanding bet result is ambiguous. Check it before resetting.');
       }
     }
-    const chase = session.chaseSide || pending?.side;
-    const missedWin = chase && paths.some(path => {
-      if (pending && path.length && path[0] === pending.side) return false; // Its accepted win was not missed.
-      return path.slice(pending ? 1 : 0).includes(chase);
-    });
+    // A recovered loss may continue only in its immediately following betting
+    // window. Any further completed round means that required window was missed,
+    // regardless of whether its unplaced bet would have won or lost.
+    const missedNextWindow = pending
+      ? paths.some(path => path.length > 1 && path[0] !== pending.side)
+      : hasLosingProgression(session) && paths.some(path => path.length > 0);
     if (pending && paths[0].length) settle(session, pending, paths[0][0]);
     const counts = paths.map(path => {
       const result = { ...session.missingRounds };
@@ -299,17 +330,18 @@
     }
     session.recovery = null;
     checkpoint(session, page, now);
-    if (missedWin) {
-      pause(session, `Stopped: a ${chase} winning round was missed while the page was unavailable. No further bet placed.`, now);
-      return false;
-    }
+    if (missedNextWindow) return abortMissedNextBet(session, now);
     session.status = session.active ? (session.pending ? `Waiting for the ${session.pending.side} bet result.` : 'Recovered — checking the next betting window.')
       : session.pending ? 'Stopped — still waiting for the outstanding bet.' : 'Stopped';
     return true;
   }
   function observe(session, observation, newId) {
-    if (session.recovery || session.needsReview) return null;
+    if (session.recovery || session.needsReview || (!session.active && !session.pending)) return null;
     if (observation.phase === 'closed') {
+      if (session.active && hasLosingProgression(session) && (!session.pending || session.pending.status === 'reserved')) {
+        abortMissedNextBet(session);
+        return null;
+      }
       if (session.chaseSide && !session.pending && session.waitingRoundKey) session.skippedChaseRoundKey = session.waitingRoundKey;
       session.waitingRoundKey = null;
       if (session.pending) session.pending.sawClosed = true;
@@ -341,8 +373,7 @@
     // If the site provides IDs, wait until the completed result actually changes.
     if (session.lastResultKey === observation.resultKey) return null;
 
-    const missedChaseWin = !session.pending && session.chaseSide && session.skippedChaseRoundKey &&
-      observation.side === session.chaseSide;
+    const missedNextWindow = !session.pending && hasLosingProgression(session);
 
     if (session.pending) {
       const pending = session.pending;
@@ -381,8 +412,8 @@
       session.missingRounds[side] = observation.side === side ? 0 : session.missingRounds[side] + 1;
       if (observation.side === side && session.countsLowerBound) session.countsLowerBound[side] = false;
     }
-    if (missedChaseWin) {
-      pause(session, `Stopped: a ${session.chaseSide} winning round was missed when its bet could not be placed. No further bet placed.`);
+    if (missedNextWindow) {
+      abortMissedNextBet(session);
       return null;
     }
     return reserveBet(session, observation, newId);
@@ -414,7 +445,9 @@
     if (observation.placementWindow === 'late') {
       if (session.chaseSide && !session.pending) session.skippedChaseRoundKey = observation.openKey;
       session.waitingRoundKey = null;
-      session.status = `Skipped ${side} bet: fewer than 5 seconds remain. Waiting for the next round.`;
+      session.status = hasLosingProgression(session)
+        ? `Next ${side} bet not placed: fewer than 5 seconds remain. This session will abort if its betting window closes.`
+        : `Skipped ${side} bet: fewer than 5 seconds remain. Waiting for the next round.`;
       return null;
     }
     if (observation.placementWindow === 'waiting' ||
@@ -472,7 +505,7 @@
       pause(session, reason || 'Bet acceptance could not be confirmed. Check the page, then reset the session.');
     } else throw new Error('Invalid bet acknowledgement.');
   }
-  const api = { DEFAULTS, cents, formatAmount, settings, missingFromHistory, placementWindow, create, pause, stop, runtime, displayStatus, normalizeSide, advanceHistory, checkpoint, loading, recoveryPaths, recover, observe, acknowledge };
+  const api = { DEFAULTS, cents, formatAmount, settings, missingFromHistory, placementWindow, create, pause, stop, runtime, displayStatus, normalizeSide, advanceHistory, checkpoint, loading, recoveryPaths, recover, hasLosingProgression, observe, acknowledge };
   globalThis.RouletteCore = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })();

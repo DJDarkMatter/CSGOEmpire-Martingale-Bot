@@ -1,7 +1,7 @@
 'use strict';
 importScripts('core.js');
 const Core = RouletteCore;
-const ACTIONS = new Set(['getState', 'saveConfig', 'saveSettings', 'stopBot', 'resetSession', 'saveSelector', 'hello', 'observe', 'betAck', 'pageError', 'pageUnavailable', 'reloadPage', 'recoverPage', 'checkpoint']);
+const ACTIONS = new Set(['getState', 'saveConfig', 'saveSettings', 'stopBot', 'resetSession', 'saveSelector', 'hello', 'observe', 'betAck', 'pageError', 'pageUnavailable', 'reloadPage', 'recoverPage', 'recoveryFailed', 'checkpoint']);
 let queue = Promise.resolve();
 
 async function readState() {
@@ -155,6 +155,24 @@ async function handle(request, sender) {
       requireOwner(state, request, sender);
       Core.recover(state.session, request.page);
       break;
+    case 'recoveryFailed': {
+      requireOwner(state, request, sender);
+      const session = state.session;
+      // A delayed failure message must not stop a recovered or stopped session.
+      if (!session.active || session.userStopped || !session.recovery || session.recovery.reloads < 1 ||
+          request.recoverySince !== session.recovery.since) break;
+      if (['accepted', 'submitted'].includes(session.pending?.status)) {
+        Core.pause(session, 'Roulette still failed fresh page checks after reloading: ' + String(request.error || 'Controls unavailable.') +
+          ' Check the outstanding bet before resetting.');
+        session.needsReview = true;
+        session.recovery = null;
+      } else {
+        session.status = session.chaseSide
+          ? `Waiting for roulette to recover — no new bet placed; preserving the ${session.chaseSide} progression.`
+          : 'Waiting for roulette to recover — no bet is outstanding; the bot will resume when the page is ready.';
+      }
+      break;
+    }
     case 'betAck':
       requireOwner(state, request, sender);
       Core.acknowledge(state.session, request.betId, request.outcome, request.reason);
