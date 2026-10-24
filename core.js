@@ -85,8 +85,11 @@
     }
     return counts;
   }
-  function placementWindow(seconds, targetSeconds) {
+  function placementWindow(seconds, targetSeconds, recoveryPlacement = false) {
     if (!Number.isFinite(seconds) || !Number.isFinite(targetSeconds) || seconds <= 0) return 'unavailable';
+    // Recovery needs time for the existing 1.3-second amount preparation, but
+    // must not wait for the normal target or apply its five-second cutoff.
+    if (recoveryPlacement) return seconds >= 2 ? 'ready' : 'late';
     if (seconds < 5) return 'late';
     return seconds > targetSeconds ? 'waiting' : 'ready';
   }
@@ -107,6 +110,7 @@
     if (!Number.isFinite(session.stoppedAt)) session.stoppedAt = now;
     session.active = false;
     session.waitingRoundKey = null;
+    session.recoveryPlacementKey = null;
     session.status = reason;
   }
   function stop(session, now = Date.now()) {
@@ -175,7 +179,10 @@
   function loading(session, reason, now = Date.now()) {
     if (!session.active) return;
     if (!session.recovery) session.recovery = { since: now, reloads: 0 };
-    if (session.pending?.status === 'reserved') session.pending = null;
+    if (session.pending?.status === 'reserved') {
+      session.recovery.placementDue = true;
+      session.pending = null;
+    }
     // Selecting a coin for an unclicked first stake is not a losing progression.
     // A real loss always leaves a doubled stake, which must retain its coin.
     if (!session.pending && session.nextBetCents === cents(session.config.betAmount, 'Base bet')) {
@@ -213,6 +220,7 @@
       session.nextBetCents = pending.amountCents * 2;
     }
     session.pending = null;
+    session.recoveryPlacementKey = null;
     return win;
   }
   function hasLosingProgression(session) {
@@ -231,6 +239,11 @@
       return false; // An already accepted bet may still be finishing its own spin.
     }
     if (page.phase !== 'open') return false;
+    const placementDue = session.recovery.placementDue === true;
+    const armRecoveredPlacement = () => {
+      session.recoveryPlacementKey = session.active && !session.pending && (placementDue || hasLosingProgression(session))
+        ? page.openKey : null;
+    };
     const halt = reason => {
       session.needsReview = !!session.pending;
       session.recovery = null;
@@ -252,6 +265,7 @@
       session.waitingRoundKey = page.openKey;
       session.skippedChaseRoundKey = null;
       session.recovery = null;
+      armRecoveredPlacement();
       checkpoint(session, page, now);
       session.status = 'Recovered — current history scanned; waiting for the next betting window.';
       return true;
@@ -331,6 +345,7 @@
     session.recovery = null;
     checkpoint(session, page, now);
     if (missedNextWindow) return abortMissedNextBet(session, now);
+    armRecoveredPlacement();
     session.status = session.active ? (session.pending ? `Waiting for the ${session.pending.side} bet result.` : 'Recovered — checking the next betting window.')
       : session.pending ? 'Stopped — still waiting for the outstanding bet.' : 'Stopped';
     return true;
@@ -338,6 +353,7 @@
   function observe(session, observation, newId) {
     if (session.recovery || session.needsReview || (!session.active && !session.pending)) return null;
     if (observation.phase === 'closed') {
+      session.recoveryPlacementKey = null;
       if (session.active && hasLosingProgression(session) && (!session.pending || session.pending.status === 'reserved')) {
         abortMissedNextBet(session);
         return null;
@@ -349,6 +365,7 @@
     }
     if (observation.phase !== 'open' || !observation.openKey || !observation.resultKey ||
         !['T', 'CT', 'Dice'].includes(observation.side)) return null;
+    if (session.recoveryPlacementKey !== observation.openKey) session.recoveryPlacementKey = null;
 
     // Seed visible results once. They describe the current streak, not past bot bets.
     if (session.lastOpenKey === null) {
@@ -429,6 +446,7 @@
       return null;
     }
     let side = session.chaseSide;
+    const recoveryPlacement = session.recoveryPlacementKey === observation.openKey;
     if (!side && Math.max(session.missingRounds.T, session.missingRounds.CT) >= session.config.turnsWait) {
       // Choose the longer absence; use T for a tie. An existing chase always takes priority.
       side = session.missingRounds.T >= session.missingRounds.CT ? 'T' : 'CT';
@@ -444,8 +462,10 @@
     }
     if (observation.placementWindow === 'late') {
       if (session.chaseSide && !session.pending) session.skippedChaseRoundKey = observation.openKey;
-      session.waitingRoundKey = null;
-      session.status = hasLosingProgression(session)
+      session.waitingRoundKey = recoveryPlacement ? observation.openKey : null;
+      session.status = recoveryPlacement
+        ? `Recovered — fewer than 2 seconds remain to prepare the ${side} bet. Rechecking this betting window.`
+        : hasLosingProgression(session)
         ? `Next ${side} bet not placed: fewer than 5 seconds remain. This session will abort if its betting window closes.`
         : `Skipped ${side} bet: fewer than 5 seconds remain. Waiting for the next round.`;
       return null;
@@ -476,6 +496,8 @@
       id: newId(), side, amountCents, roundKey: observation.openKey,
       baselineResultKey: observation.resultKey, status: 'reserved', sawClosed: false
     };
+    if (recoveryPlacement) session.pending.recoveryPlacement = true;
+    session.recoveryPlacementKey = null;
     session.skippedChaseRoundKey = null;
     session.waitingRoundKey = null;
     session.chaseSide = side;
@@ -498,6 +520,7 @@
     } else if (outcome === 'deferred') {
       session.pending = null;
       loading(session, reason);
+      if (session.recovery) session.recovery.placementDue = true;
     } else if (outcome === 'cancelled') {
       session.pending = null;
       pause(session, reason || 'Bet cancelled before clicking; no loss recorded.');

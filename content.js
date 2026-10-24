@@ -186,6 +186,9 @@
     return { phase: sample.phase, history, historyDirection: direction, identity: sample.identity || null,
       seconds: sample.seconds, hasWheel: sample.hasWheel };
   }
+  function roundSignature(sample) {
+    return JSON.stringify([sample.identity, sample.history || sample.side, sample.health?.roundId ?? null]);
+  }
   function inspect(config, historyDirection = null) {
     try {
       config = Core.settings(config);
@@ -367,12 +370,17 @@
       }
       let sample = snapshot(session.config, null, true);
       if (sample.phase !== 'open' || !sample.controlsReady) throw new Error('Betting closed before the amount could be entered.');
-      if (!Number.isFinite(sample.seconds) || sample.seconds < 5) throw new Error('Fewer than 5 seconds remain or the countdown is unavailable; no click sent.');
-      const roundSignature = JSON.stringify([sample.identity, sample.history || sample.side]);
+      const recoveryPlacement = bet.recoveryPlacement === true;
+      const entryMinimum = recoveryPlacement ? 2 : 5;
+      if (!Number.isFinite(sample.seconds) || sample.seconds < entryMinimum) {
+        throw new Error(`Fewer than ${entryMinimum} seconds remain to prepare the bet or the countdown is unavailable; no click sent.`);
+      }
+      const closingAt = Date.now() + sample.seconds * 1000;
+      const expectedRound = roundSignature(sample);
       const before = sample.confirmation === 'balance' ? sample.balanceCents : bet.side === 'T' ? sample.ownT : sample.ownCT;
       const expected = sample.confirmation === 'balance' ? before - bet.amountCents : before + bet.amountCents;
       if (expected < 0) throw new Error('The next stake exceeds the available balance; no click sent.');
-      const verifyEntry = (current, checkAmount = true) => {
+      const verifyEntry = (current, checkAmount = true, finalClick = false) => {
         if (current.phase !== 'open' || !current.controlsReady) throw new Error('Betting closed before clicking.');
         if (checkAmount) {
           const raw = String(current.amount.value);
@@ -387,8 +395,12 @@
               : 'The website amount still contains non-decimal characters after formatting; no click sent.');
           }
         }
-        if (!Number.isFinite(current.seconds) || current.seconds < 5 ||
-            JSON.stringify([current.identity, current.history || current.side]) !== roundSignature) {
+        // A frozen display cannot extend the original window. Recovery permits
+        // the countdown to fall below five while the verified amount settles.
+        const remaining = recoveryPlacement ? Math.min(current.seconds, (closingAt - Date.now()) / 1000) : current.seconds;
+        const minimum = recoveryPlacement ? (finalClick ? 0.5 : 0) : 5;
+        if (!Number.isFinite(current.seconds) || current.seconds <= 0 || remaining <= 0 || remaining < minimum ||
+            roundSignature(current) !== expectedRound) {
           throw new Error('The betting window ended or the round changed during amount entry; no click sent.');
         }
       };
@@ -470,7 +482,7 @@
         return;
       }
       sample = snapshot(session.config, null, true);
-      verifyEntry(sample);
+      verifyEntry(sample, true, true);
       if (sample.amount !== preparedInput) throw new PageUnavailable('The site replaced the amount input before clicking; no click sent.');
       const currentAmount = sample.confirmation === 'balance' ? sample.balanceCents : bet.side === 'T' ? sample.ownT : sample.ownCT;
       if (currentAmount !== before) throw new Error('The displayed amount changed before clicking; no click sent.');
@@ -566,12 +578,12 @@
         passiveHistory = history;
       }
     } catch { /* An idle/non-roulette page has no readable history yet. */ }
-    const session = ownSession();
+    let session = ownSession();
     if (!session || session.needsReview || (!session.active && !session.pending)) return;
     busy = true;
     try {
-      const sample = snapshot(session.config);
-      const now = Date.now();
+      let sample = snapshot(session.config);
+      let now = Date.now();
       if (session.recovery && sample.phase === 'closed' && !session.pending && Core.hasLosingProgression(session)) {
         await sessionMessage(session, 'recoverPage', { page: pageState(sample) });
         return;
@@ -591,7 +603,9 @@
       if (session.recovery) {
         const signature = JSON.stringify([sample.phase, sample.identity, sample.history]);
         if (signature !== recoverySignature) { recoverySignature = signature; recoveryStableSince = now; }
-        if (sample.phase !== 'open' || now - recoveryStableSince < 900) return;
+        const placementMayBeDue = !!session.pending || Core.hasLosingProgression(session) || session.recovery.placementDue;
+        if (sample.phase !== 'open' || now - recoveryStableSince < (placementMayBeDue ? 350 : 900)) return;
+        const recoveredRound = roundSignature(sample);
         const cycle = (tracker?.sessionId === session.id ? tracker.cycle : 0) + 1;
         const page = { ...pageState(sample), openKey: `${session.id}:${documentId}:${cycle}`,
           resultKey: sample.identity ? `result:${sample.identity}` : `cycle:${documentId}:${cycle}` };
@@ -603,7 +617,17 @@
           historyDirection: page.historyDirection, historyLimit: Math.max(10, sample.history?.length || 0), betAtSeconds: chooseTarget() };
         missingSince = null; failureConfirmation = null; reloadAsked = false; recoverySignature = ''; visibilityChanged = false; lastSent = '';
         interruptedSession = null; liveness = null;
-        return;
+        session = ownSession();
+        if (!session?.active || session.pending || session.recoveryPlacementKey !== page.openKey) return;
+        // Continue in this task rather than losing another poll interval. The
+        // worker reconciled history; now re-read before reserving any new bet.
+        sample = snapshot(session.config);
+        now = Date.now();
+        if (sample.phase === 'waiting') return;
+        if (sample.phase === 'open' && roundSignature(sample) !== recoveredRound) {
+          await sessionMessage(session, 'pageUnavailable', { error: 'Roulette advanced during recovery; checking the required betting window again.' });
+          return;
+        }
       }
       missingSince = null; reloadAsked = false; recoverySignature = '';
       if (!tracker || tracker.sessionId !== session.id) {
@@ -653,16 +677,17 @@
             }
           } else side = tracker.historySide;
         }
+        const openKey = `${session.id}:${documentId}:${tracker.cycle}`;
         observation = {
           phase: 'open', side, controlsReady: sample.controlsReady,
-          placementWindow: Core.placementWindow(sample.seconds, tracker.betAtSeconds),
+          placementWindow: Core.placementWindow(sample.seconds, tracker.betAtSeconds, session.recoveryPlacementKey === openKey),
           betAtSeconds: tracker.betAtSeconds,
           historyDirection: tracker.historyDirection,
           checkpoint: pageState(sample),
           ...(session.lastOpenKey === null ? {
             initialHistory: sample.history ? (sample.newestEnd === 'first' ? [...sample.history].reverse() : [...sample.history]) : [side]
           } : {}),
-          openKey: `${session.id}:${documentId}:${tracker.cycle}`,
+          openKey,
           resultKey: sample.identity ? `result:${sample.identity}` : `cycle:${documentId}:${tracker.cycle}`
         };
       }

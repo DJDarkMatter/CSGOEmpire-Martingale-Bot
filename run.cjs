@@ -110,6 +110,7 @@ async function contentHarness(options = {}) {
   const events = [];
   const inputEvents = [];
   const clickedAmounts = [];
+  const clickedTimes = [];
   const inputFocusedAtBet = [];
   const warnings = [];
   let requiresFormatting = false;
@@ -232,6 +233,13 @@ async function contentHarness(options = {}) {
   const ct = new Element('button');
   const nodes = { '#result': result, '#t': t, '#ct': ct, '#amount': amount, '#own-t': ownT, '#own-ct': ownCT };
   const countdown = new Element('div', {}, String(options.initialSeconds ?? '9,8'));
+  if (options.runningCountdown) {
+    let closesAt = clock + Number(countdown.textContent.replace(',', '.')) * 1000;
+    Object.defineProperty(countdown, 'textContent', {
+      get() { return Math.max(0, (closesAt - clock) / 1000).toFixed(2); },
+      set(value) { closesAt = clock + Number(String(value).replace(',', '.')) * 1000; }
+    });
+  }
   nodes[Core.DEFAULTS.selectors.countdown] = countdown;
   const wheel = new Element('div');
   const balance = new Element('span', {}, options.balance || '100.00');
@@ -262,6 +270,7 @@ async function contentHarness(options = {}) {
   }
   for (const [button, own] of [[t, ownT], [ct, ownCT]]) button.click = () => {
     clicked++;
+    clickedTimes.push(clock);
     inputFocusedAtBet.push(amount.focused === true);
     const stake = options.siteBlurModel || options.commitOnBlur || options.commitOnAmountFocus || options.commitOnAmountClick || options.requiresClickBeforeInput || options.commitAfterDebounce
       ? committedStake : Core.cents(amount.value, 'Stake');
@@ -289,6 +298,10 @@ async function contentHarness(options = {}) {
       }
       if (options.resetAmountAfterSubmit && request.action === 'betAck' && request.outcome === 'submitted') amount.value = '0';
       if (options.resetStoredStakeAfterSubmit && request.action === 'betAck' && request.outcome === 'submitted') committedStake = 0;
+      if (request.action === 'betAck' && request.outcome === 'submitted') {
+        if (options.changeSiteRoundAfterSubmit) siteRoundId = Number(siteRoundId) + 1;
+        if (options.submitReplyDelayMs) clock += options.submitReplyDelayMs;
+      }
       return response;
     },
     onMessage: { addListener: listener => { contentMessage = listener; } }
@@ -428,7 +441,7 @@ async function contentHarness(options = {}) {
   return { worker, complete, closeRound, openRound, tick, result, get amount() { return amount; }, ownT, ownCT, t, ct, countdown, balance, wheel, events, clicked: () => clicked,
     inspect: alternate => worker.tabs.sendMessage(1, { action: 'inspect', config: alternate || config }), config,
     toolbar: toolbarCallbacks, toolbarState: () => clone(toolbarState), inputEvents, clickedAmounts,
-    inputFocusedAtBet, warnings, messages,
+    inputFocusedAtBet, warnings, messages, clickedTimes, now: () => clock,
     watchdog: () => watchdogTick(),
     async siteState(values) {
       if (Object.hasOwn(values, 'initialized')) initialized = values.initialized;
@@ -442,7 +455,10 @@ async function contentHarness(options = {}) {
     async loading(value) { pageLoading = value; tick(); await flush(); },
     restoreForFinalCheck(selector) { pageLoading = false; missingForOneRead = selector; },
     async hidden(value) { document.hidden = value; visibilityListener(); await flush(); },
-    async reload() { bootContent(); await flush(); clock += 1200; tick(); await flush(); clock += 1000; tick(); await flush(); tick(); await flush(); },
+    async reload(warmup = true) {
+      bootContent(); await flush();
+      if (warmup) { clock += 1200; tick(); await flush(); clock += 1000; tick(); await flush(); tick(); await flush(); }
+    },
     async advance(milliseconds) {
       if (options.manualTimers) {
         const end = clock + milliseconds;
@@ -474,7 +490,165 @@ function recoveryFixture(target = 'T', mode = 'accepted') {
   return { state, history, page, other };
 }
 
+async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
+  const other = side === 'T' ? 'CT' : 'T';
+  const history = [side, 'Dice', other, other, other];
+  const options = { siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+    betAmount: .01, turnsWait: 3, roundSeconds: 25,
+    initialHistory: overrides.direction === 'first' ? [...history].reverse() : history, ...overrides };
+  const page = await contentHarness(options);
+  if (options.manualTimers) await page.advance(2000);
+  assert.deepEqual(page.clickedAmounts, [1]);
+  await page.loading(true); await page.openRound(1, 'dice');
+  options.beforeReturn?.(options, page);
+  page.countdown.textContent = String(remaining);
+  page.restoreForFinalCheck(null);
+  const returnedAt = page.now();
+  await page.reload(false); await page.advance(350);
+  return { page, returnedAt, options };
+}
+
 (async () => {
+  await test('recovery timing bypasses the normal target and five-second cutoff while retaining time for verified input preparation', () => {
+    assert.equal(Core.placementWindow(25, 10, true), 'ready');
+    assert.equal(Core.placementWindow(5, 10, true), 'ready');
+    assert.equal(Core.placementWindow(4, 10, true), 'ready');
+    assert.equal(Core.placementWindow(2, 10, true), 'ready');
+    assert.equal(Core.placementWindow(1.9, 10, true), 'late');
+    assert.equal(Core.placementWindow(0, 10, true), 'unavailable');
+    assert.equal(Core.placementWindow(null, 10, true), 'unavailable');
+    assert.equal(Core.placementWindow(25, 10), 'waiting');
+    assert.equal(Core.placementWindow(4, 10), 'late');
+  });
+  await test('reconciled recovery placement survives a worker restart and reserves exactly one doubled stake for its own window', async () => {
+    const { state, history, page } = recoveryFixture();
+    const worker = workerHarness({ config: state.config, session: state }, () => 13000);
+    const owner = { documentId: state.documentId, sessionId: state.id };
+    const recovered = await worker.dispatch({ action: 'recoverPage', ...owner, page: page([...history.slice(1), 'Dice'], 5) }, worker.contentSender);
+    assert.equal(recovered.session.recoveryPlacementKey, 'recovered-open'); assert.equal(recovered.session.losses, 1);
+    worker.boot();
+    const observation = { phase: 'open', side: 'Dice', openKey: 'recovered-open', resultKey: 'recovered-result', controlsReady: true,
+      placementWindow: Core.placementWindow(5, 10, true), betAtSeconds: 10 };
+    const placed = await worker.dispatch({ action: 'observe', ...owner, observation }, worker.contentSender);
+    assert.equal(placed.instruction.amountCents, 2); assert.equal(placed.instruction.recoveryPlacement, true);
+    assert.equal(placed.session.recoveryPlacementKey, null);
+    const again = await worker.dispatch({ action: 'observe', ...owner, observation }, worker.contentSender);
+    assert.equal(again.instruction, null); assert.equal(again.session.pending.id, placed.instruction.id);
+    assert.equal(again.session.losses, 1); assert.equal(again.session.netLossCents, 1);
+  });
+  await test('a real five-second countdown after reload salvages the doubled bet on either coin and history order without waiting another tick', async () => {
+    for (const side of ['T', 'CT']) for (const direction of ['first', 'last']) {
+      const { page, returnedAt } = await reloadAfterLoss(side, 5, { direction, runningCountdown: true,
+        siteBlurModel: true, focusUnavailable: true, modelDelayMs: 50 });
+      const restored = page.worker.read().session;
+      assert.deepEqual(page.clickedAmounts, [1, 2], restored.status);
+      assert.equal(restored.active, true); assert.equal(restored.recovery, null); assert.equal(restored.pending.side, side);
+      assert.equal(restored.pending.status, 'accepted'); assert.equal(restored.pending.recoveryPlacement, true);
+      assert.equal(restored.losses, 1); assert.equal(restored.wins, 0); assert.equal(restored.netLossCents, 1);
+      assert.ok(page.clickedTimes[1] - returnedAt < 2500, 'Recovery must not wait for another polling step.');
+      assert.ok(Number(page.countdown.textContent) > 0 && Number(page.countdown.textContent) < 5);
+      await page.complete(2, side.toLowerCase());
+      assert.equal(page.worker.read().session.nextBetCents, 1); assert.equal(page.worker.read().session.wins, 1);
+      assert.equal(page.worker.read().session.netLossCents, -1);
+    }
+  });
+  await test('a recovered missing doubled bet is placed immediately even when more than the normal ten-second target remains', async () => {
+    const { page } = await reloadAfterLoss('T', 25, { runningCountdown: true });
+    assert.deepEqual(page.clickedAmounts, [1, 2]);
+    assert.ok(Number(page.countdown.textContent) > 20);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('recovery with exactly two seconds at entry keeps the model-settling delays and clicks with its final time margin intact', async () => {
+    const { page, returnedAt } = await reloadAfterLoss('T', 2.35, { runningCountdown: true, siteBlurModel: true });
+    assert.deepEqual(page.clickedAmounts, [1, 2]);
+    const remainingAtClick = 2.35 - (page.clickedTimes[1] - returnedAt) / 1000;
+    assert.ok(remainingAtClick >= .5 && remainingAtClick < 1);
+    assert.equal(page.worker.read().session.pending.status, 'accepted'); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('an accepted bet still in the same five-second window is preserved after reload without a duplicate click or fake loss', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true, runningCountdown: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
+    const betId = page.worker.read().session.pending.id;
+    await page.loading(true); page.countdown.textContent = '5'; page.restoreForFinalCheck(null);
+    await page.reload(false); await page.advance(350); await page.advance(500);
+    const restored = page.worker.read().session;
+    assert.equal(restored.active, true); assert.equal(restored.recovery, null); assert.equal(restored.pending.id, betId);
+    assert.equal(restored.recoveryPlacementKey, null); assert.deepEqual(page.clickedAmounts, [1]);
+    assert.equal(restored.losses, 0); assert.equal(restored.netLossCents, 0);
+  });
+  await test('an uncertain submitted money click is never retried after reload even with five seconds available', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true, manualTimers: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], accept: false });
+    await page.advance(1350); assert.deepEqual(page.clickedAmounts, [1]);
+    await page.loading(true); page.countdown.textContent = '5'; page.restoreForFinalCheck(null);
+    await page.reload(false); await page.advance(2000);
+    const stopped = page.worker.read().session;
+    assert.equal(stopped.active, false); assert.equal(stopped.needsReview, true);
+    assert.equal(stopped.pending.status, 'submitted'); assert.deepEqual(page.clickedAmounts, [1]); assert.equal(stopped.losses, 0);
+  });
+  await test('an interrupted unclicked first stake can be prepared once after reload in an open five-second window', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true, manualTimers: true,
+      runningCountdown: true, betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'] });
+    assert.equal(page.clicked(), 0); assert.equal(page.worker.read().session.pending.status, 'reserved');
+    await page.loading(true); assert.equal(page.worker.read().session.recovery.placementDue, true);
+    page.countdown.textContent = '5'; page.restoreForFinalCheck(null);
+    await page.reload(false); await page.advance(350); await page.advance(1700);
+    const restored = page.worker.read().session;
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(restored.pending.status, 'accepted'); assert.equal(restored.active, true);
+    assert.equal(restored.losses, 0); assert.equal(restored.wins, 0); assert.equal(restored.netLossCents, 0);
+  });
+  await test('a genuinely closed required window aborts recovery even if stale countdown text still says five', async () => {
+    const page = await contentHarness({ siteLayout: true, siteHealth: true, dryRun: false, seedHistory: true,
+      betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], roundSeconds: 25 });
+    await page.complete(1, 'dice'); await page.loading(true); await page.closeRound();
+    page.countdown.isConnected = true; page.countdown.textContent = '5';
+    page.restoreForFinalCheck(null); await page.reload(false); await page.advance(350);
+    assert.equal(page.worker.read().session.active, false); assert.match(page.worker.read().session.status, /betting window closed/);
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('a server round change before the recovery click is detected even while the completed-result icons are unchanged', async () => {
+    const { page } = await reloadAfterLoss('T', 5, { runningCountdown: true,
+      beforeReturn(options) { options.changeSiteRoundAfterSubmit = true; } });
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.active, false);
+    assert.match(page.worker.read().session.status, /round changed/);
+    assert.equal(page.worker.read().session.losses, 1); assert.equal(page.worker.read().session.netLossCents, 1);
+  });
+  await test('closure during recovery amount entry prevents the late money click without fabricating another loss', async () => {
+    const { page } = await reloadAfterLoss('T', 5, { runningCountdown: true,
+      beforeReturn(options) { options.closeOnInput = true; } });
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.active, false);
+    assert.equal(page.worker.read().session.pending, null); assert.equal(page.worker.read().session.losses, 1);
+    assert.equal(page.worker.read().session.netLossCents, 1);
+  });
+  await test('a delayed submitted reply cannot extend a recovered window just because the displayed countdown froze at five', async () => {
+    const { page } = await reloadAfterLoss('T', 5, {
+      beforeReturn(options) { options.submitReplyDelayMs = 5000; } });
+    assert.equal(page.countdown.textContent, '5'); assert.deepEqual(page.clickedAmounts, [1]);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.pending, null);
+    assert.match(page.worker.read().session.status, /window ended/); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('urgent recovery retains the actual site stake check instead of clicking a correct-looking but stale two-cent model', async () => {
+    const { page } = await reloadAfterLoss('CT', 5, { runningCountdown: true, siteBlurModel: true,
+      beforeReturn(options) { options.ignoreModelUpdates = true; } });
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.active, false);
+    assert.match(page.worker.read().session.status, /stored stake is 0.01/);
+    assert.equal(page.worker.read().session.losses, 1); assert.equal(page.worker.read().session.netLossCents, 1);
+  });
+  await test('Stop during urgent recovered preparation prevents a later doubled click', async () => {
+    const { page } = await reloadAfterLoss('T', 5, { runningCountdown: true, manualTimers: true });
+    assert.equal(page.worker.read().session.pending.amountCents, 2); assert.equal(page.worker.read().session.pending.status, 'reserved');
+    await page.toolbar.stop(); await page.advance(2000);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.userStopped, true);
+    assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.losses, 1);
+  });
+  await test('insufficient preparation time keeps checking the same open recovery window instead of claiming a round was missed', async () => {
+    const { page } = await reloadAfterLoss('T', 1.8);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.pending, null);
+    assert.match(page.worker.read().session.status, /fewer than 2 seconds/); assert.deepEqual(page.clickedAmounts, [1]);
+    await page.timer(3);
+    assert.deepEqual(page.clickedAmounts, [1, 2]); assert.equal(page.worker.read().session.pending.status, 'accepted');
+    assert.equal(page.worker.read().session.losses, 1); assert.equal(page.worker.read().session.netLossCents, 1);
+  });
   await test('recovery in the same betting window preserves an accepted stake without clicking or settling it twice', () => {
     const { state, page } = recoveryFixture();
     const id = state.pending.id;
