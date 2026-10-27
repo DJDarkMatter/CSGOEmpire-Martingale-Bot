@@ -127,6 +127,8 @@ async function contentHarness(options = {}) {
   let siteRoundId = options.siteHealth ? 0 : undefined;
   const siteSubscribers = new Set();
   const messages = [];
+  const serverBets = {};
+  const observedClickSeconds = [];
   const notifySite = (type, payload = {}) => {
     for (const listener of siteSubscribers) listener({ type: 'roulette/' + type, payload });
   };
@@ -271,16 +273,44 @@ async function contentHarness(options = {}) {
   for (const [button, own] of [[t, ownT], [ct, ownCT]]) button.click = () => {
     clicked++;
     clickedTimes.push(clock);
+    observedClickSeconds.push(Number(countdown.textContent.replace(',', '.')));
     inputFocusedAtBet.push(amount.focused === true);
     const stake = options.siteBlurModel || options.commitOnBlur || options.commitOnAmountFocus || options.commitOnAmountClick || options.requiresClickBeforeInput || options.commitAfterDebounce
       ? committedStake : Core.cents(amount.value, 'Stake');
     clickedAmounts.push(stake);
+    if (options.siteLedger) {
+      const round = String(siteRoundId);
+      const coin = button === t ? 't' : 'ct';
+      if (!serverBets[round]) serverBets[round] = [];
+      let bet = serverBets[round].find(row => row.uid === 77 && row.coin === coin);
+      if (!bet) {
+        bet = { uid: 77, coin, round, amount: 0, id: null, unconfirmedAmounts: [] };
+        serverBets[round].push(bet);
+      }
+      bet.amount += stake;
+      bet.unconfirmedAmounts.push(stake);
+      const receipt = () => {
+        bet.id = 'receipt-' + clicked;
+        const index = bet.unconfirmedAmounts.indexOf(stake);
+        if (index >= 0) bet.unconfirmedAmounts.splice(index, 1);
+        notifySite('updateBet');
+      };
+      if (options.accept !== false && !options.serverReject) {
+        if (options.receiptDelayMs) timers.push({ at: clock + options.receiptDelayMs, callback: receipt });
+        else receipt();
+      }
+    }
     if (options.accept !== false && stake >= 1) {
-      if (options.siteLayout) {
-        balance.textContent = String((Core.cents(balance.textContent, 'Balance', true) - stake - (options.extraDebit || 0)) / 100);
-      } else {
-        own.textContent = String((Core.cents(own.textContent, 'Own amount', true) + stake) / 100);
-        if (options.commaDecimal) own.textContent = own.textContent.replace('.', ',');
+      const updateDisplay = () => {
+        if (options.siteLayout) balance.textContent = String((Core.cents(balance.textContent, 'Balance', true) - stake - (options.extraDebit || 0)) / 100);
+        else {
+          own.textContent = String((Core.cents(own.textContent, 'Own amount', true) + stake) / 100);
+          if (options.commaDecimal) own.textContent = own.textContent.replace('.', ',');
+        }
+      };
+      if (!options.freezeDisplay) {
+        if (options.displayDelayMs) timers.push({ at: clock + options.displayDelayMs, callback: updateDisplay });
+        else updateDisplay();
       }
     }
     if (options.hideBalanceOnClick) {
@@ -310,10 +340,11 @@ async function contentHarness(options = {}) {
   class Observer { observe() {} disconnect() {} }
   const siteStore = {
     subscribe(listener) { siteSubscribers.add(listener); return () => siteSubscribers.delete(listener); },
-    state: { roulette: {
+    state: { get user() { return options.siteLedger ? { model: { id: 77 } } : undefined; }, roulette: {
       get isInitialized() { return initialized; },
       get roundState() { return roundState; },
       get round() { return siteRoundId; },
+      get bets() { return options.siteLedger ? serverBets : undefined; },
       get betAmountRaw() {
         if (options.missingStakeStore) return {};
         const usesModel = options.siteBlurModel || options.commitOnBlur || options.commitOnAmountFocus ||
@@ -373,6 +404,7 @@ async function contentHarness(options = {}) {
       return intervalNumber;
     }, clearInterval() {}, clearTimeout() {},
     setTimeout: (callback, milliseconds) => {
+      milliseconds += options.delayExtraMs || 0;
       const guarded = () => { if (thisGeneration === generation) callback(); };
       if (options.manualTimers) timers.push({ at: clock + milliseconds, callback: guarded });
       else {
@@ -417,7 +449,7 @@ async function contentHarness(options = {}) {
     if (options.clearAmountEachRound) { amount.value = '0.00'; committedStake = 0; }
     if (options.siteLayout) {
       const pending = worker.read().session?.pending;
-      if (pending?.status === 'accepted' && pending.side === Core.normalizeSide(side) && !config.dryRun) {
+      if (pending?.status === 'accepted' && pending.side === Core.normalizeSide(side) && !config.dryRun && !options.freezeDisplay) {
         balance.textContent = String((Core.cents(balance.textContent, 'Balance', true) + 2 * pending.amountCents) / 100);
       }
       const icon = new Element('div');
@@ -441,7 +473,21 @@ async function contentHarness(options = {}) {
   return { worker, complete, closeRound, openRound, tick, result, get amount() { return amount; }, ownT, ownCT, t, ct, countdown, balance, wheel, events, clicked: () => clicked,
     inspect: alternate => worker.tabs.sendMessage(1, { action: 'inspect', config: alternate || config }), config,
     toolbar: toolbarCallbacks, toolbarState: () => clone(toolbarState), inputEvents, clickedAmounts,
-    inputFocusedAtBet, warnings, messages, clickedTimes, now: () => clock,
+    inputFocusedAtBet, warnings, messages, clickedTimes, observedClickSeconds, serverBets, now: () => clock,
+    ownBet(side, roundId = null) {
+      const id = randomUUID();
+      let result;
+      const reply = event => {
+        const value = JSON.parse(event.detail);
+        if (value.id === id) result = value;
+      };
+      document.documentElement.addEventListener('roulette-bot:own-bet-read', reply);
+      document.documentElement.dispatchEvent(new CustomEvent('roulette-bot:read-own-bet', {
+        bubbles: true, detail: JSON.stringify({ id, side, ...(roundId !== null ? { roundId } : {}) })
+      }));
+      document.documentElement.removeEventListener('roulette-bot:own-bet-read', reply);
+      return result;
+    },
     watchdog: () => watchdogTick(),
     async siteState(values) {
       if (Object.hasOwn(values, 'initialized')) initialized = values.initialized;
@@ -508,7 +554,223 @@ async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
   return { page, returnedAt, options };
 }
 
+function receiptSettings(overrides = {}) {
+  return { siteLayout: true, siteHealth: true, siteLedger: true, dryRun: false, seedHistory: true,
+    betAmount: .01, turnsWait: 3, initialHistory: ['T', 'Dice', 'CT', 'CT', 'CT'], roundSeconds: 25, ...overrides };
+}
+async function pulse(page, milliseconds) {
+  const end = page.now() + milliseconds;
+  while (page.now() < end) await page.advance(Math.min(250, end - page.now()));
+}
+
 (async () => {
+  await test('server-confirmed own bets are accepted with a frozen balance and their wins are recorded once on either coin', async () => {
+    for (const side of ['T', 'CT']) {
+      const other = side === 'T' ? 'CT' : 'T';
+      const page = await contentHarness(receiptSettings({ freezeDisplay: true, initialHistory: [side, 'Dice', other, other, other] }));
+      assert.equal(page.balance.textContent, '100.00'); assert.equal(page.worker.read().session.pending.status, 'accepted');
+      assert.deepEqual(page.clickedAmounts, [1]); assert.equal(page.worker.read().session.pending.confirmation.site.beforeConfirmedCents, 0);
+      await page.complete(1, side.toLowerCase());
+      const state = page.worker.read().session;
+      assert.equal(state.active, true); assert.equal(state.wins, 1); assert.equal(state.losses, 0); assert.equal(state.netLossCents, -1);
+      page.tick(); await flush(); assert.equal(page.worker.read().session.wins, 1); assert.deepEqual(page.clickedAmounts, [1]);
+    }
+  });
+  await test('a receipt later than the original confirmation timeout is still accepted without stopping or retrying', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 6000 }));
+    await page.advance(6500);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    assert.equal(page.worker.read().session.pending.awaitingConfirmation, true); assert.deepEqual(page.clickedAmounts, [1]);
+    await page.advance(1000);
+    assert.equal(page.worker.read().session.pending.status, 'accepted'); assert.equal(page.worker.read().session.active, true);
+    await page.complete(1, 't');
+    assert.equal(page.worker.read().session.wins, 1); assert.equal(page.worker.read().session.netLossCents, -1);
+  });
+  await test('a server receipt arriving after the winning result settles that win instead of discarding an unconfirmed submitted bet', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 9000 }));
+    await page.advance(6500); await page.complete(1, 't');
+    assert.equal(page.worker.read().session.wins, 0); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    await page.advance(3000);
+    const state = page.worker.read().session;
+    assert.equal(state.active, true); assert.equal(state.wins, 1); assert.equal(state.losses, 0); assert.equal(state.netLossCents, -1);
+    assert.equal(state.pending, null); assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('a delayed accepted loss is settled once and the following open window receives the correctly doubled bet', async () => {
+    const options = receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 9000, runningCountdown: true });
+    const page = await contentHarness(options);
+    await page.advance(6500); await page.complete(1, 'dice'); await page.advance(3000);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.losses, 1);
+    assert.equal(page.worker.read().session.nextBetCents, 2); assert.equal(page.worker.read().session.netLossCents, 1);
+    options.receiptDelayMs = 0;
+    await page.timer(13); await pulse(page, 4000);
+    assert.deepEqual(page.clickedAmounts, [1, 2]); assert.equal(page.worker.read().session.pending.status, 'accepted');
+    assert.equal(page.worker.read().session.losses, 1); assert.equal(page.worker.read().session.pending.side, 'T');
+  });
+  await test('late acceptance cannot resume a loss after the required next betting window was also missed', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 12000 }));
+    await page.advance(6500); await page.complete(1, 'dice'); await page.complete(2, 'dice');
+    await page.advance(5000); await page.advance(500); await page.advance(500);
+    const state = page.worker.read().session;
+    assert.equal(state.active, false); assert.match(state.status, /betting window closed/);
+    assert.equal(state.losses, 1); assert.equal(state.wins, 0); assert.equal(state.netLossCents, 1);
+    assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('optimistic own-bet amounts and a matching display debit do not count as a server-accepted wager', async () => {
+    const page = await contentHarness(receiptSettings({ serverReject: true }));
+    assert.equal(page.balance.textContent, '99.99'); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    assert.equal(page.worker.read().session.active, true); assert.deepEqual(page.clickedAmounts, [1]);
+    const own = page.ownBet('T', '0'); assert.equal(own.confirmedCents, 0); assert.equal(own.unconfirmedCents, 1);
+    await page.complete(1, 't'); await page.advance(20000);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.wins, 0);
+    assert.equal(page.worker.read().session.losses, 0); assert.equal(page.worker.read().session.netLossCents, 0);
+    assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('a positive receipt after the longer review pause can still record the win while keeping the session stopped', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 25000 }));
+    await page.advance(22000);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    await page.complete(1, 't'); await page.advance(3500);
+    const state = page.worker.read().session;
+    assert.equal(state.active, false); assert.equal(state.wins, 1); assert.equal(state.losses, 0); assert.equal(state.netLossCents, -1);
+    assert.equal(state.pending, null); assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('Stop during delayed acceptance still permits recording a confirmed win and never resumes betting', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 6000 }));
+    await page.advance(6500); await page.toolbar.stop(); await page.advance(1000); await page.complete(1, 't');
+    const state = page.worker.read().session;
+    assert.equal(state.active, false); assert.equal(state.userStopped, true); assert.equal(state.wins, 1);
+    assert.equal(state.netLossCents, -1); assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('delayed confirmation metadata survives a worker restart and accepts only the original pending stake', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 6000 }));
+    await page.advance(6500);
+    const saved = page.worker.read().session.pending;
+    page.worker.boot(); await page.advance(1000);
+    assert.equal(page.worker.read().session.pending.id, saved.id); assert.equal(page.worker.read().session.pending.status, 'accepted');
+    assert.deepEqual(page.clickedAmounts, [1]); await page.complete(1, 't');
+    assert.equal(page.worker.read().session.wins, 1); assert.equal(page.worker.read().session.netLossCents, -1);
+  });
+  await test('the durable submission baseline can verify a real receipt even when the later click timestamp was not saved', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 6000 }));
+    await page.advance(6500);
+    const session = page.worker.read().session;
+    delete session.pending.clickedAt;
+    assert.ok(Number.isFinite(session.pending.submittedAt));
+    await page.worker.storage.local.set({ session }); page.worker.boot(); await page.advance(1000);
+    assert.equal(page.worker.read().session.pending.status, 'accepted'); assert.deepEqual(page.clickedAmounts, [1]);
+    await page.complete(1, 't'); assert.equal(page.worker.read().session.wins, 1);
+  });
+  await test('a page handoff waits for the saved submitted receipt rather than immediately failing recovery or repeating the click', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, freezeDisplay: true, receiptDelayMs: 6000 }));
+    await page.advance(6500);
+    const documentId = page.worker.read().session.documentId;
+    await page.reload(false); await page.advance(350);
+    assert.equal(page.worker.read().session.active, true); assert.ok(page.worker.read().session.recovery);
+    await page.advance(1000); await page.advance(500);
+    const restored = page.worker.read().session;
+    assert.notEqual(restored.documentId, documentId); assert.equal(restored.active, true); assert.equal(restored.recovery, null);
+    assert.equal(restored.pending.status, 'accepted'); assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('the read-only own-bet adapter excludes optimistic additions, other users, other coins and unavailable old rounds', async () => {
+    const page = await contentHarness(receiptSettings({ autoStart: false }));
+    page.serverBets['0'] = [
+      { uid: 77, coin: 't', round: 0, id: 'a', amount: 10, unconfirmedAmounts: [3] },
+      { uid: 77, coin: 't', round: 0, id: null, amount: 2, unconfirmedAmounts: [2] },
+      { uid: 88, coin: 't', round: 0, id: 'other', amount: 900, unconfirmedAmounts: [] },
+      { uid: 77, coin: 'ct', round: 0, id: 'b', amount: 6, unconfirmedAmounts: [] },
+      { uid: 77, coin: 't', round: 0, id: 'c', amount: 4, unconfirmedAmounts: [] }
+    ];
+    assert.equal(page.ownBet('T').confirmedCents, 11); assert.equal(page.ownBet('T').unconfirmedCents, 5);
+    assert.equal(page.ownBet('CT').confirmedCents, 6); assert.equal(page.ownBet('T', 'missing').supported, false);
+    page.serverBets['0'][0].unconfirmedAmounts = [11];
+    assert.equal(page.ownBet('T').supported, false);
+  });
+  await test('another user or side cannot confirm this bot click even if the displayed balance has the expected debit', async () => {
+    for (const field of ['uid', 'coin']) {
+      const page = await contentHarness(receiptSettings({ manualTimers: true }));
+      await page.advance(1350);
+      page.serverBets['0'][0][field] = field === 'uid' ? 88 : 'ct';
+      await page.advance(5000);
+      assert.equal(page.worker.read().session.pending.status, 'submitted'); assert.equal(page.worker.read().session.wins, 0);
+      assert.equal(page.worker.read().session.netLossCents, 0); assert.deepEqual(page.clickedAmounts, [1]);
+    }
+  });
+  await test('unsupported own-bet row formats can fall back to stable display proof in that same current round', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true }));
+    await page.advance(1350); delete page.serverBets['0'][0].unconfirmedAmounts;
+    await page.advance(500);
+    assert.equal(page.worker.read().session.pending.status, 'accepted'); assert.equal(page.worker.read().session.active, true);
+    assert.deepEqual(page.clickedAmounts, [1]);
+  });
+  await test('an unavailable old own-bet record cannot be confirmed using a later round balance that happens to match', async () => {
+    const page = await contentHarness(receiptSettings({ serverReject: true }));
+    await page.complete(1, 't'); delete page.serverBets['0']; await page.advance(1000);
+    assert.equal(page.balance.textContent, '99.99'); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    assert.equal(page.worker.read().session.wins, 0); assert.equal(page.worker.read().session.netLossCents, 0);
+  });
+  await test('delayed display-only confirmation is kept under observation when the server adapter is unavailable', async () => {
+    const page = await contentHarness(receiptSettings({ siteLedger: false, manualTimers: true, displayDelayMs: 6000 }));
+    await page.advance(6500);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    await page.advance(1000); await page.advance(200);
+    assert.equal(page.worker.read().session.pending.status, 'accepted'); await page.complete(1, 't');
+    assert.equal(page.worker.read().session.wins, 1); assert.equal(page.worker.read().session.netLossCents, -1);
+  });
+  await test('invalid confirmation baselines do not authorize submission and delayed tracking does not manufacture a settled result', () => {
+    const state = session({ dryRun: false }); round(state, 1, 'T', false);
+    const bet = round(state, 2, 'T', false);
+    assert.throws(() => Core.acknowledge(state, bet.id, 'submitted', '', {
+      display: { method: 'balance', before: 100, expected: 99 }, site: { roundId: '1', beforeConfirmedCents: -1 }
+    }));
+    assert.equal(state.pending.status, 'reserved');
+    Core.acknowledge(state, bet.id, 'submitted', '', {
+      display: { method: 'balance', before: 5000, expected: 5000 - bet.amountCents }, site: { roundId: '1', beforeConfirmedCents: 0 }
+    });
+    Core.acknowledge(state, bet.id, 'clicked'); Core.acknowledge(state, bet.id, 'awaiting');
+    assert.equal(state.active, true); assert.equal(state.pending.status, 'submitted'); assert.equal(state.wins, 0); assert.equal(state.losses, 0);
+  });
+  await test('live preparation starts early and the actual click follows the configured countdown rather than occurring after its input delay', async () => {
+    for (const target of [8, 10, 15]) {
+      const page = await contentHarness(receiptSettings({ manualTimers: true, runningCountdown: true, siteBlurModel: true,
+        focusUnavailable: true, initialSeconds: 30, betBeforeSeconds: target, timingVarianceSeconds: 0 }));
+      await page.timer(target + 3); await page.advance(1700);
+      assert.equal(page.clicked(), 0); assert.equal(page.worker.read().session.pending.status, 'submitted');
+      await pulse(page, 2300);
+      assert.deepEqual(page.clickedAmounts, [1]); assert.ok(Math.abs(page.observedClickSeconds[0] - target) <= .06);
+      assert.equal(page.worker.read().session.pending.status, 'accepted');
+    }
+  });
+  await test('the first and doubled stakes both click near ten seconds remaining while retaining exact one-cent and two-cent models', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, runningCountdown: true, siteBlurModel: true,
+      initialSeconds: 25, timingVarianceSeconds: 0 }));
+    await page.timer(13); await pulse(page, 4000); await page.complete(1, 'dice');
+    await page.timer(13); await pulse(page, 4500);
+    assert.deepEqual(page.clickedAmounts, [1, 2]);
+    assert.ok(page.observedClickSeconds.every(value => Math.abs(value - 10) <= .06));
+    assert.equal(page.worker.read().session.losses, 1); assert.equal(page.worker.read().session.netLossCents, 1);
+  });
+  await test('slower amount preparation is allowed for before the click target instead of silently shifting the target by several seconds', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, runningCountdown: true, siteBlurModel: true,
+      initialSeconds: 25, timingVarianceSeconds: 0, delayExtraMs: 250 }));
+    await page.timer(13); await pulse(page, 5000);
+    assert.deepEqual(page.clickedAmounts, [1]); assert.ok(Math.abs(page.observedClickSeconds[0] - 10) < .5);
+    await page.complete(1, 'dice'); await page.timer(14); await pulse(page, 6000);
+    assert.deepEqual(page.clickedAmounts, [1, 2]); assert.ok(Math.abs(page.observedClickSeconds[1] - 10) < .5);
+  });
+  await test('Stop after preparation but before the click target cancels the durable pre-click marker without sending a money click', async () => {
+    const page = await contentHarness(receiptSettings({ manualTimers: true, runningCountdown: true, initialSeconds: 25 }));
+    await page.timer(13); await page.advance(1700);
+    assert.equal(page.clicked(), 0); assert.equal(page.worker.read().session.pending.status, 'submitted');
+    await page.toolbar.stop(); await page.advance(3000);
+    assert.equal(page.worker.read().session.active, false); assert.equal(page.worker.read().session.pending, null);
+    assert.equal(page.clicked(), 0); assert.equal(page.worker.read().session.netLossCents, 0);
+  });
+  await test('a normal timed bet cannot use a frozen positive display to extend its deadline during a delayed submission reply', async () => {
+    const page = await contentHarness(receiptSettings({ submitReplyDelayMs: 14000 }));
+    assert.equal(page.clicked(), 0); assert.equal(page.worker.read().session.active, false);
+    assert.equal(page.worker.read().session.pending, null); assert.equal(page.worker.read().session.losses, 0);
+    assert.match(page.worker.read().session.status, /window ended/);
+  });
   await test('recovery timing bypasses the normal target and five-second cutoff while retaining time for verified input preparation', () => {
     assert.equal(Core.placementWindow(25, 10, true), 'ready');
     assert.equal(Core.placementWindow(5, 10, true), 'ready');
@@ -1445,20 +1707,21 @@ async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
     for (const target of ['T', 'CT']) {
       const opposite = target === 'T' ? 'CT' : 'T';
       const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, betAmount: .01,
-        turnsWait: 1, initialHistory: [opposite, opposite], initialSeconds: 25, roundSeconds: 25, commitOnBlur: true });
+        turnsWait: 1, initialHistory: [opposite, opposite], initialSeconds: 25, roundSeconds: 25, commitOnBlur: true,
+        runningCountdown: true, manualTimers: true });
       let state = page.worker.read().session;
       assert.equal(state.pending, null); assert.equal(page.clicked(), 0);
       assert.equal(page.amount.value, '0.1'); assert.match(state.status, /10.0 seconds remaining/);
-      page.countdown.textContent = '10.1'; await page.advance(500);
+      await page.timer(13); await page.advance(2000);
       assert.equal(page.clicked(), 0);
-      page.countdown.textContent = '9.9'; await page.advance(250);
+      await page.advance(1500);
       assert.equal(page.clicked(), 1); assert.equal(page.worker.read().session.pending.status, 'accepted');
       await page.complete(1, 'dice');
       state = page.worker.read().session;
       assert.equal(state.active, true); assert.equal(state.pending, null);
       assert.equal(state.losses, 1); assert.equal(state.netLossCents, 1); assert.equal(state.nextBetCents, 2);
       assert.equal(page.clicked(), 1); assert.match(state.status, /Waiting to place/);
-      page.countdown.textContent = '9.9'; await page.advance(250);
+      await page.timer(12); await page.advance(2500);
       state = page.worker.read().session;
       assert.equal(page.clicked(), 2); assert.deepEqual(page.clickedAmounts, [1, 2]);
       assert.equal(state.pending.side, target); assert.equal(state.pending.status, 'accepted');
@@ -1537,12 +1800,13 @@ async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
   await test('the timing target varies within its bounds, stays fixed for a round, and supports zero variation', async () => {
     for (const [randomValue, variance, target] of [[0, .5, 9.5], [1, .5, 10.5], [.25, .5, 9.75], [0, 0, 10]]) {
       const page = await contentHarness({ siteLayout: true, dryRun: false, seedHistory: true, turnsWait: 1,
-        initialHistory: ['CT', 'CT'], initialSeconds: 25, randomValue, timingVarianceSeconds: variance });
+        initialHistory: ['CT', 'CT'], initialSeconds: 25, randomValue, timingVarianceSeconds: variance,
+        manualTimers: true, runningCountdown: true });
       const status = page.worker.read().session.status;
       await page.advance(500); assert.equal(page.worker.read().session.status, status);
-      page.countdown.textContent = String(target + .05); await page.advance(500);
+      await page.timer(target + 3); await page.advance(2500);
       assert.equal(page.clicked(), 0);
-      page.countdown.textContent = String(target - .05); await page.advance(500);
+      await page.advance(1000);
       assert.equal(page.clicked(), 1); assert.equal(page.worker.read().session.pending.status, 'accepted');
     }
   });
@@ -1947,10 +2211,12 @@ async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
     assert.equal(page.worker.read().session.netLossCents, -1234);
     assert.equal(page.clicked(), 1);
   });
-  await test('a rejected live click pauses once without inventing a loss or retrying', async () => {
+  await test('a click without acceptance keeps checking, then pauses without inventing a loss or retrying', async () => {
     const page = await contentHarness({ dryRun: false, accept: false });
     await page.complete(1, 't'); await page.complete(2, 't');
     assert.equal(page.clicked(), 1);
+    assert.equal(page.worker.read().session.active, true); assert.equal(page.worker.read().session.pending.awaitingConfirmation, true);
+    await page.advance(20000);
     assert.equal(page.worker.read().session.active, false);
     assert.equal(page.worker.read().session.netLossCents, 0);
     assert.equal(page.worker.read().session.losses, 0);
@@ -2154,6 +2420,10 @@ async function reloadAfterLoss(side = 'T', remaining = 5, overrides = {}) {
       const page = await contentHarness({ siteLayout: true, dryRun: false, ...options });
       await page.complete(1, 't'); await page.complete(2, 't');
       assert.equal(page.clicked(), 1);
+      if (options.accept === false) {
+        assert.equal(page.worker.read().session.active, true);
+        await page.advance(20000);
+      }
       assert.equal(page.worker.read().session.active, false);
       assert.equal(page.worker.read().session.losses, 0);
       assert.equal(page.worker.read().session.pending.status, 'submitted');

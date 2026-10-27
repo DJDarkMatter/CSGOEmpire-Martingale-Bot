@@ -25,6 +25,8 @@
   let watchingPage = false;
   let interruptedSession = null;
   let liveness = null;
+  let preparationLeadMs = 3000;
+  let displayEvidence = null;
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   class PageUnavailable extends Error {}
 
@@ -46,6 +48,53 @@
       }));
     } finally { target.removeEventListener('roulette-bot:page-health-read', reply); }
     return health;
+  }
+  function readOwnBet(side, roundId = null) {
+    const target = document.documentElement;
+    const id = crypto.randomUUID();
+    let result = null;
+    const reply = event => {
+      if (event.target !== target || typeof event.detail !== 'string') return;
+      try {
+        const value = JSON.parse(event.detail);
+        if (value.id === id && value.supported === true && typeof value.roundId === 'string' && value.roundId &&
+            Number.isSafeInteger(value.confirmedCents) && value.confirmedCents >= 0 &&
+            Number.isSafeInteger(value.unconfirmedCents) && value.unconfirmedCents >= 0) result = value;
+      } catch { /* Leave display confirmation available when unsupported. */ }
+    };
+    target.addEventListener('roulette-bot:own-bet-read', reply);
+    try {
+      target.dispatchEvent(new CustomEvent('roulette-bot:read-own-bet', {
+        bubbles: true, composed: true, detail: JSON.stringify({ id, side, ...(roundId !== null ? { roundId } : {}) })
+      }));
+    } finally { target.removeEventListener('roulette-bot:own-bet-read', reply); }
+    return result;
+  }
+  function acceptanceConfirmed(session, bet) {
+    const baseline = bet.confirmation;
+    if (!baseline) return false;
+    if (baseline.site) {
+      const own = readOwnBet(bet.side, baseline.site.roundId);
+      if (own) return own.roundId === baseline.site.roundId &&
+        own.confirmedCents === baseline.site.beforeConfirmedCents + bet.amountCents;
+      // Unsupported store formats may use the old display proof only while
+      // that same wager's round is still current, never a later round's balance.
+      if (readPageHealth()?.roundId !== baseline.site.roundId) return false;
+    }
+    const sample = confirmation(session.config);
+    const value = sample.confirmation === 'balance' ? sample.balanceCents : bet.side === 'T' ? sample.ownT : sample.ownCT;
+    if (sample.confirmation !== baseline.display.method) return false;
+    if (value === baseline.display.expected) {
+      if (displayEvidence?.betId === bet.id && Date.now() - displayEvidence.at >= 150) return true;
+      if (displayEvidence?.betId !== bet.id) displayEvidence = { betId: bet.id, at: Date.now() };
+    } else {
+      displayEvidence = null;
+      if ((sample.confirmation === 'own' && value > baseline.display.expected) ||
+          (sample.confirmation === 'balance' && value < baseline.display.expected)) {
+        throw new Error('The displayed amount changed by more than this stake; acceptance is ambiguous.');
+      }
+    }
+    return false;
   }
 
   function visible(element) {
@@ -242,8 +291,8 @@
   async function sessionMessage(session, action, extra = {}) {
     return send({ action, documentId, sessionId: session.id, ...extra });
   }
-  async function acknowledge(session, bet, outcome, reason) {
-    return sessionMessage(session, 'betAck', { betId: bet.id, outcome, reason });
+  async function acknowledge(session, bet, outcome, reason, confirmation = null) {
+    return sessionMessage(session, 'betAck', { betId: bet.id, outcome, reason, ...(confirmation ? { confirmation } : {}) });
   }
   function canClick(session, bet) {
     const current = ownSession();
@@ -360,7 +409,6 @@
   }
   async function performBet(session, bet) {
     let clicked = false;
-    let verifiedSiteStake = null;
     placingBet = { sessionId: session.id, betId: bet.id };
     try {
       if (!canClick(session, bet)) return;
@@ -369,6 +417,7 @@
         return;
       }
       let sample = snapshot(session.config, null, true);
+      const preparationStartedAt = Date.now();
       if (sample.phase !== 'open' || !sample.controlsReady) throw new Error('Betting closed before the amount could be entered.');
       const recoveryPlacement = bet.recoveryPlacement === true;
       const entryMinimum = recoveryPlacement ? 2 : 5;
@@ -397,7 +446,7 @@
         }
         // A frozen display cannot extend the original window. Recovery permits
         // the countdown to fall below five while the verified amount settles.
-        const remaining = recoveryPlacement ? Math.min(current.seconds, (closingAt - Date.now()) / 1000) : current.seconds;
+        const remaining = Math.min(current.seconds, (closingAt - Date.now()) / 1000);
         const minimum = recoveryPlacement ? (finalClick ? 0.5 : 0) : 5;
         if (!Number.isFinite(current.seconds) || current.seconds <= 0 || remaining <= 0 || remaining < minimum ||
             roundSignature(current) !== expectedRound) {
@@ -410,7 +459,6 @@
           console.warn('[Roulette Bot] Site stake mismatch', { requested: amountText, field: site.field, siteStake: site.amount });
           throw new Error(`The field shows ${site.field}, but the site's stored stake is ${site.amount}; no bet clicked. Check the amount control and selected currency.`);
         }
-        verifiedSiteStake = site.amount;
       };
       // Run the widget's click/focus formatting BEFORE replacing the value.
       // Clearing then inserting also updates a stale model when text is unchanged.
@@ -467,12 +515,33 @@
       if (sample.amount !== preparedInput) throw new PageUnavailable('The site replaced the amount input during entry; preparing again after recovery.');
       await verifySiteStake(preparedInput);
       if (!canClick(session, bet)) return;
+      preparationLeadMs = Math.max(2000, Math.min(6000,
+        Math.max(preparationLeadMs * .8, Date.now() - preparationStartedAt + 750)));
+      const ownBefore = readOwnBet(bet.side);
+      if (ownBefore?.unconfirmedCents) throw new Error('An existing unconfirmed site bet is still pending; no new click sent.');
+      const baseline = {
+        display: { method: sample.confirmation, before, expected },
+        site: ownBefore ? { roundId: ownBefore.roundId, beforeConfirmedCents: ownBefore.confirmedCents } : null
+      };
 
       // The worker must persist the submitted marker before any possible money action.
-      await acknowledge(session, bet, 'submitted');
+      await acknowledge(session, bet, 'submitted', '', baseline);
       if (!canClick(session, bet)) {
         await acknowledge(session, bet, 'cancelled', 'Stopped before clicking; no loss recorded.');
         return;
+      }
+      // Settings describe the Bet click time. Prepare and persist early, then
+      // wait until that target with a fresh round check on every pass.
+      if (!recoveryPlacement && Number.isFinite(bet.clickAtSeconds)) {
+        while (Math.min(sample.seconds, (closingAt - Date.now()) / 1000) > bet.clickAtSeconds) {
+          await delay(50);
+          if (!canClick(session, bet)) {
+            await acknowledge(session, bet, 'cancelled', 'Stopped before clicking; no loss recorded.');
+            return;
+          }
+          sample = snapshot(session.config, null, true);
+          verifyEntry(sample);
+        }
       }
       // Persisting the submitted marker is asynchronous. Recheck the actual
       // store afterwards in case the site reset it while that reply was pending.
@@ -486,34 +555,27 @@
       if (sample.amount !== preparedInput) throw new PageUnavailable('The site replaced the amount input before clicking; no click sent.');
       const currentAmount = sample.confirmation === 'balance' ? sample.balanceCents : bet.side === 'T' ? sample.ownT : sample.ownCT;
       if (currentAmount !== before) throw new Error('The displayed amount changed before clicking; no click sent.');
+      if (ownBefore) {
+        const latest = readOwnBet(bet.side, ownBefore.roundId);
+        if (!latest || latest.confirmedCents !== ownBefore.confirmedCents || latest.unconfirmedCents) {
+          throw new Error('The site own-bet record changed before clicking; no click sent.');
+        }
+      }
       clicked = true; // Treat a throwing click as uncertain; never retry it blindly.
       placingBet.clicked = true;
       (bet.side === 'T' ? sample.tButton : sample.ctButton).click();
+      displayEvidence = null;
+      await acknowledge(session, bet, 'clicked');
 
       const deadline = Date.now() + 4500;
       while (Date.now() < deadline) {
         await delay(150);
-        sample = confirmation(session.config);
-        const value = sample.confirmation === 'balance' ? sample.balanceCents : bet.side === 'T' ? sample.ownT : sample.ownCT;
-        if (value === expected) {
-          // Avoid acknowledging a single transient value during a balance animation.
-          await delay(150);
-          const stable = confirmation(session.config);
-          const stableValue = stable.confirmation === 'balance' ? stable.balanceCents : bet.side === 'T' ? stable.ownT : stable.ownCT;
-          if (stableValue === expected) {
-            await acknowledge(session, bet, 'accepted');
-            return;
-          }
-        }
-        if ((sample.confirmation === 'own' && value > expected) || (sample.confirmation === 'balance' && value < expected)) {
-          throw new Error('The displayed amount changed by more than this stake; acceptance is ambiguous.');
+        if (acceptanceConfirmed(session, { ...bet, confirmation: baseline })) {
+          await acknowledge(session, bet, 'accepted');
+          return;
         }
       }
-      console.warn('[Roulette Bot] Unconfirmed bet amount', {
-        requested: amountText, field: preparedInput.value, siteStake: verifiedSiteStake,
-        characters: Array.from(String(preparedInput.value), char => 'U+' + char.codePointAt(0).toString(16).toUpperCase().padStart(4, '0'))
-      });
-      throw new Error(`Bet click was not confirmed by the displayed amount (site stake verified: ${amountText}). Check the page before resetting.`);
+      await acknowledge(session, bet, 'awaiting');
     } catch (error) {
       if (ownSession()?.pending?.id !== bet.id) return; // Stop may already have cancelled this reservation.
       try {
@@ -579,9 +641,22 @@
       }
     } catch { /* An idle/non-roulette page has no readable history yet. */ }
     let session = ownSession();
-    if (!session || session.needsReview || (!session.active && !session.pending)) return;
+    const canVerify = session?.pending?.status === 'submitted' && session.pending.confirmation &&
+      Number.isFinite(session.pending.clickedAt ?? session.pending.submittedAt);
+    if (!session || (session.needsReview && !canVerify) || (!session.active && !session.pending)) return;
     busy = true;
     try {
+      if (canVerify) {
+        const pending = session.pending;
+        if (acceptanceConfirmed(session, pending)) {
+          await acknowledge(session, pending, 'accepted');
+          session = ownSession();
+        } else if (session.active && Date.now() - (pending.clickedAt ?? pending.submittedAt) >= 20000) {
+          await acknowledge(session, pending, 'uncertain', 'Acceptance could not be verified after 20 seconds. No retry; still checking this outstanding bet.');
+          session = ownSession();
+        }
+      }
+      if (!session || session.needsReview) return;
       let sample = snapshot(session.config);
       let now = Date.now();
       if (session.recovery && sample.phase === 'closed' && !session.pending && Core.hasLosingProgression(session)) {
@@ -601,6 +676,8 @@
         return;
       }
       if (session.recovery) {
+        if (session.pending?.status === 'submitted' && session.pending.confirmation &&
+            Number.isFinite(session.pending.clickedAt ?? session.pending.submittedAt)) return;
         const signature = JSON.stringify([sample.phase, sample.identity, sample.history]);
         if (signature !== recoverySignature) { recoverySignature = signature; recoveryStableSince = now; }
         const placementMayBeDue = !!session.pending || Core.hasLosingProgression(session) || session.recovery.placementDue;
@@ -680,7 +757,8 @@
         const openKey = `${session.id}:${documentId}:${tracker.cycle}`;
         observation = {
           phase: 'open', side, controlsReady: sample.controlsReady,
-          placementWindow: Core.placementWindow(sample.seconds, tracker.betAtSeconds, session.recoveryPlacementKey === openKey),
+          placementWindow: Core.placementWindow(sample.seconds,
+            tracker.betAtSeconds + (session.config.dryRun ? 0 : preparationLeadMs / 1000), session.recoveryPlacementKey === openKey),
           betAtSeconds: tracker.betAtSeconds,
           historyDirection: tracker.historyDirection,
           checkpoint: pageState(sample),
@@ -692,6 +770,10 @@
         };
       }
       const signature = JSON.stringify(observation);
+      // Keep observing phase changes, but never settle or replace a submitted
+      // click based solely on the next roulette color. Await actual acceptance.
+      if (observation.phase === 'open' && session.pending?.status === 'submitted' && session.pending.confirmation &&
+          Number.isFinite(session.pending.clickedAt ?? session.pending.submittedAt)) return;
       if (signature === lastSent) {
         if (observation.phase === 'open' && now - lastHeartbeat >= 2000) {
           lastHeartbeat = now;

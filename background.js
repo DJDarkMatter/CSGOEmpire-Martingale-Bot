@@ -175,7 +175,7 @@ async function handle(request, sender) {
     }
     case 'betAck':
       requireOwner(state, request, sender);
-      Core.acknowledge(state.session, request.betId, request.outcome, request.reason);
+      Core.acknowledge(state.session, request.betId, request.outcome, request.reason, request.confirmation);
       break;
     case 'pageError':
       requireOwner(state, request, sender);

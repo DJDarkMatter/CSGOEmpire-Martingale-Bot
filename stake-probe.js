@@ -14,6 +14,51 @@
     if (stores.size !== 1) throw new Error('The site stake store is unavailable.');
     return [...stores][0];
   }
+  document.addEventListener('roulette-bot:read-own-bet', event => {
+    if (event.target !== document.documentElement || typeof event.detail !== 'string') return;
+    let request;
+    try { request = JSON.parse(event.detail); } catch { return; }
+    if (typeof request.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(request.id) || !['T', 'CT'].includes(request.side)) return;
+    let response = { supported: false };
+    try {
+      const store = siteStore();
+      const roulette = store.state.roulette;
+      const uid = store.state.user?.model?.id;
+      const roundId = request.roundId ?? roulette.round;
+      if (!['string', 'number'].includes(typeof uid) || !['string', 'number'].includes(typeof roundId) ||
+          !roulette.bets || typeof roulette.bets !== 'object' || Array.isArray(roulette.bets)) throw new Error('Unsupported own-bet store.');
+      const round = String(roundId);
+      const rows = roulette.bets[round];
+      if (!rows && String(roulette.round) !== round) throw new Error('That round is no longer available.');
+      if (rows !== undefined && !Array.isArray(rows)) throw new Error('Unsupported own-bet list.');
+      const integer = value => {
+        if (!(typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value)))) throw new Error('Unsupported stake.');
+        const number = Number(value);
+        if (!Number.isSafeInteger(number) || number < 0) throw new Error('Invalid stake.');
+        return number;
+      };
+      const coin = request.side === 'T' ? 't' : 'ct';
+      let confirmedCents = 0;
+      let unconfirmedCents = 0;
+      for (const bet of rows || []) {
+        if (String(bet.uid) !== String(uid) || bet.coin !== coin) continue;
+        if (String(bet.round) !== round || !Array.isArray(bet.unconfirmedAmounts)) throw new Error('Unsupported own bet.');
+        const amount = integer(bet.amount);
+        const unconfirmed = bet.unconfirmedAmounts.reduce((sum, value) => sum + integer(value), 0);
+        if (!Number.isSafeInteger(unconfirmed) || unconfirmed > amount) throw new Error('Invalid unconfirmed amount.');
+        // The captured site adds optimistic amounts before an own_bet receipt.
+        // Only a server ID plus the amount minus those pending additions counts.
+        const hasId = (typeof bet.id === 'string' && bet.id.length > 0) || (typeof bet.id === 'number' && bet.id > 0);
+        confirmedCents += hasId ? amount - unconfirmed : 0;
+        unconfirmedCents += unconfirmed;
+      }
+      if (!Number.isSafeInteger(confirmedCents) || !Number.isSafeInteger(unconfirmedCents)) throw new Error('Stake total overflow.');
+      response = { supported: true, roundId: round, confirmedCents, unconfirmedCents };
+    } catch { /* An unsupported layout falls back to the existing display check. */ }
+    document.documentElement.dispatchEvent(new CustomEvent('roulette-bot:own-bet-read', {
+      detail: JSON.stringify({ id: request.id, ...response })
+    }));
+  }, true);
   document.addEventListener('roulette-bot:read-page-health', event => {
     if (event.target !== document.documentElement || typeof event.detail !== 'string') return;
     let request;

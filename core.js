@@ -496,6 +496,7 @@
       id: newId(), side, amountCents, roundKey: observation.openKey,
       baselineResultKey: observation.resultKey, status: 'reserved', sawClosed: false
     };
+    if (Number.isFinite(observation.betAtSeconds)) session.pending.clickAtSeconds = observation.betAtSeconds;
     if (recoveryPlacement) session.pending.recoveryPlacement = true;
     session.recoveryPlacementKey = null;
     session.skippedChaseRoundKey = null;
@@ -504,18 +505,41 @@
     session.status = `Preparing ${session.config.dryRun ? 'simulated ' : ''}${side} bet: ${amountCents / 100} coins.`;
     return { ...session.pending, dryRun: session.config.dryRun };
   }
-  function acknowledge(session, id, outcome, reason = '') {
+  function acknowledge(session, id, outcome, reason = '', confirmation = null) {
     const pending = session.pending;
     if (!pending || pending.id !== id) throw new Error('Bet reservation is no longer current.');
     if (outcome === 'submitted') {
       if (!session.active || pending.status !== 'reserved') throw new Error('Betting has stopped.');
+      if (confirmation) {
+        const display = confirmation.display;
+        const site = confirmation.site;
+        if (!display || !['own', 'balance'].includes(display.method) ||
+            !Number.isSafeInteger(display.before) || display.before < 0 || !Number.isSafeInteger(display.expected) || display.expected < 0 ||
+            display.expected !== display.before + (display.method === 'balance' ? -pending.amountCents : pending.amountCents) ||
+            (site && (typeof site.roundId !== 'string' || !site.roundId ||
+              !Number.isSafeInteger(site.beforeConfirmedCents) || site.beforeConfirmedCents < 0))) throw new Error('Invalid bet confirmation baseline.');
+        pending.confirmation = { display: { ...display }, site: site ? { ...site } : null };
+        pending.submittedAt = Date.now();
+        pending.awaitingConfirmation = true;
+      }
       pending.status = 'submitted';
       session.status = 'Bet submitted — waiting for acceptance.';
+    } else if (outcome === 'clicked') {
+      if (pending.status !== 'submitted') throw new Error('Bet was not submitted.');
+      pending.clickedAt = Date.now();
+      pending.awaitingConfirmation = true;
+      session.status = `${session.active ? 'Waiting' : 'Stopped — waiting'} for the site's ${pending.side} bet confirmation. No retry.`;
+    } else if (outcome === 'awaiting') {
+      if (pending.status !== 'submitted') throw new Error('Bet was not submitted.');
+      pending.awaitingConfirmation = true;
+      session.status = `${session.active ? 'Waiting' : 'Stopped — waiting'} for delayed ${pending.side} bet confirmation. The click will not be repeated.`;
     } else if (outcome === 'accepted') {
       if (pending.status !== 'submitted' && !(session.config.dryRun && pending.status === 'reserved')) {
         throw new Error('Bet was not submitted.');
       }
       pending.status = 'accepted';
+      if (pending.awaitingConfirmation && pending.confirmation) session.needsReview = false;
+      pending.awaitingConfirmation = false;
       session.status = `${session.active ? 'Waiting' : 'Stopped — waiting'} for the ${pending.side} bet result (${pending.amountCents / 100} coins).`;
     } else if (outcome === 'deferred') {
       session.pending = null;
